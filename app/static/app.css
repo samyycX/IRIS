@@ -1,0 +1,133 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(180deg, #0f172a 0%, #111827 100%);
+}
+
+a {
+  color: #7dd3fc;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 2rem;
+  padding: 1.5rem 2rem;
+  border-bottom: 1px solid #334155;
+}
+
+.topbar h1,
+.card h2 {
+  margin: 0 0 0.5rem;
+}
+
+.page {
+  padding: 1.5rem 2rem 3rem;
+  display: grid;
+  gap: 1.25rem;
+}
+
+.card {
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid #334155;
+  border-radius: 14px;
+  padding: 1.25rem;
+}
+
+.form-grid,
+.meta-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.form-grid label,
+.meta-grid div {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.form-grid .checkbox-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.form-grid .checkbox-field input[type="checkbox"] {
+  margin: 0;
+  padding: 0;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  border-radius: 8px;
+  border: 1px solid #475569;
+  padding: 0.7rem 0.9rem;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+button {
+  cursor: pointer;
+  background: #2563eb;
+  border-color: #2563eb;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 0.75rem;
+  border-bottom: 1px solid #334155;
+  text-align: left;
+  vertical-align: top;
+}
+
+.event-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.event-row {
+  padding: 0.9rem;
+  border-radius: 10px;
+  background: #111827;
+  border: 1px solid #1e293b;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.event-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.4rem;
+}
+
+pre,
+code {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.event-data {
+  margin: 0;
+  padding: 0.75rem;
+  border-radius: 8px;
+  background: #0b1120;
+  border: 1px solid #334155;
+  font-size: 0.9rem;
+  color: #cbd5e1;
+}
