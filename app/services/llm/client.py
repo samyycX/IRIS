@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from time import monotonic
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlsplit
 
 from openai import AsyncOpenAI
 
@@ -174,19 +172,12 @@ class LLMClient:
         )
         if not self.enabled:
             logger.info(
-                "llm_related_urls_fallback_disabled",
+                "llm_related_urls_filter_disabled",
                 source_url=source_url,
                 candidate_url_count=len(normalized_candidates),
                 context_count=len(context),
             )
-            return self._fallback_filter_related_urls(
-                source_url=source_url,
-                title=title,
-                text=text,
-                context=context,
-                candidate_urls=normalized_candidates,
-                candidate_url_entity_context=normalized_candidate_context,
-            )
+            return normalized_candidates
 
         selected_urls: list[str] = []
         batches = _batched(normalized_candidates, size=RELATED_URL_BATCH_SIZE)
@@ -270,16 +261,6 @@ class LLMClient:
                     response_length=len(content),
                     payload=content,
                 )
-                selected_urls.extend(
-                    self._fallback_filter_related_urls(
-                        source_url=source_url,
-                        title=title,
-                        text=text,
-                        context=context,
-                        candidate_urls=batch,
-                        candidate_url_entity_context=normalized_candidate_context,
-                    )
-                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "llm_related_urls_failed",
@@ -289,16 +270,6 @@ class LLMClient:
                     elapsed_ms=_elapsed_ms(started_at),
                     batch_size=len(batch),
                     error=str(exc),
-                )
-                selected_urls.extend(
-                    self._fallback_filter_related_urls(
-                        source_url=source_url,
-                        title=title,
-                        text=text,
-                        context=context,
-                        candidate_urls=batch,
-                        candidate_url_entity_context=normalized_candidate_context,
-                    )
                 )
 
         normalized_selected_urls = _normalize_candidate_urls(selected_urls)
@@ -326,67 +297,6 @@ class LLMClient:
             )
         return summary, entities
 
-    def _fallback_filter_related_urls(
-        self,
-        *,
-        source_url: str,
-        title: str | None,
-        text: str,
-        context: list[dict[str, Any]],
-        candidate_urls: list[str],
-        candidate_url_entity_context: list[dict[str, Any]] | None = None,
-    ) -> list[str]:
-        ranking_keywords = _build_ranking_keywords(
-            source_url=source_url,
-            title=title,
-            text=text,
-            context=context,
-        )
-        candidate_entity_context_map = _build_candidate_entity_context_map(
-            candidate_url_entity_context or []
-        )
-        source_host = urlsplit(source_url).netloc.casefold()
-        scored_candidates: list[tuple[int, int, str]] = []
-
-        for index, url in enumerate(candidate_urls):
-            parsed = urlsplit(url)
-            path = parsed.path.casefold()
-            segments = [segment for segment in path.split("/") if segment]
-            query = {
-                key.casefold(): value.casefold()
-                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            }
-
-            if any(path.endswith(ext) for ext in _STATIC_RESOURCE_EXTENSIONS):
-                continue
-            if query.get("action") in {"edit", "history", "submit"}:
-                continue
-            if any(segment in _LOW_VALUE_PATH_SEGMENTS for segment in segments):
-                continue
-            if any(segment.startswith(prefix) for prefix in _LOW_VALUE_SEGMENT_PREFIXES for segment in segments):
-                continue
-
-            entity_context = candidate_entity_context_map.get(url.casefold())
-            if entity_context and _should_skip_candidate_due_to_existing_entity(url, entity_context):
-                continue
-
-            decoded_url = _decode_url_for_matching(url)
-            score = 0
-            if parsed.netloc.casefold() == source_host:
-                score += 2
-            if any(keyword in decoded_url for keyword in ranking_keywords):
-                score += 4
-            if any(hint in decoded_url for hint in _HIGH_VALUE_URL_HINTS):
-                score += 1
-            if entity_context:
-                score -= _existing_entity_penalty(entity_context)
-                if _looks_like_fresh_fact_url(url):
-                    score += 2
-
-            scored_candidates.append((score, index, url))
-
-        scored_candidates.sort(key=lambda item: (-item[0], item[1]))
-        return [url for _, _, url in scored_candidates]
 
     def _fallback_merge_entity(
         self,
@@ -530,134 +440,6 @@ def _filter_deleted_relations(
     ]
 
 
-_STATIC_RESOURCE_EXTENSIONS = (
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".ico",
-    ".css",
-    ".js",
-    ".json",
-    ".xml",
-    ".pdf",
-    ".zip",
-    ".rar",
-    ".7z",
-    ".ttf",
-    ".otf",
-    ".woff",
-    ".woff2",
-    ".mp3",
-    ".wav",
-    ".ogg",
-    ".mp4",
-    ".webm",
-)
-
-_LOW_VALUE_PATH_SEGMENTS = {
-    "login",
-    "logout",
-    "signup",
-    "register",
-    "search",
-    "comment",
-    "comments",
-    "user",
-    "users",
-    "profile",
-    "profiles",
-    "privacy",
-    "terms",
-    "tag",
-    "tags",
-    "category",
-    "categories",
-    "archive",
-    "archives",
-}
-
-_LOW_VALUE_SEGMENT_PREFIXES = (
-    "special:",
-    "template:",
-    "file:",
-    "image:",
-    "help:",
-    "talk:",
-    "user:",
-    "category:",
-)
-
-_HIGH_VALUE_URL_HINTS = (
-    "wiki",
-    "character",
-    "resonator",
-    "weapon",
-    "echo",
-    "quest",
-    "story",
-    "guide",
-    "tutorial",
-    "version",
-    "event",
-    "news",
-)
-
-
-def _build_ranking_keywords(
-    *,
-    source_url: str,
-    title: str | None,
-    text: str,
-    context: list[dict[str, Any]],
-) -> list[str]:
-    keywords: list[str] = []
-    if title:
-        keywords.append(title)
-
-    source_path = unquote(urlsplit(source_url).path)
-    keywords.extend(part for part in re.split(r"[/_\-\s]+", source_path) if part)
-
-    for match in context:
-        if not isinstance(match, dict):
-            continue
-        for key in ("name", "normalized_name", "category", "summary"):
-            value = match.get(key)
-            if isinstance(value, str) and value.strip():
-                keywords.append(value)
-        aliases = match.get("aliases", [])
-        if isinstance(aliases, list):
-            keywords.extend(alias for alias in aliases if isinstance(alias, str) and alias.strip())
-
-    keywords.extend(re.findall(r"[A-Za-z0-9][A-Za-z0-9:_-]{2,}|[\u4e00-\u9fff]{2,8}", text[:500]))
-    return _dedupe_rank_keywords(keywords)
-
-
-def _dedupe_rank_keywords(values: list[str]) -> list[str]:
-    results: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        cleaned = " ".join(value.split()).strip()
-        if len(cleaned) < 2:
-            continue
-        key = cleaned.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(key)
-    return results
-
-
-def _decode_url_for_matching(url: str) -> str:
-    parsed = urlsplit(url)
-    parts = [parsed.netloc, unquote(parsed.path), unquote(parsed.query)]
-    return " ".join(part.casefold() for part in parts if part)
-
-
 def _normalize_candidate_url_entity_context(
     contexts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -739,56 +521,6 @@ def _compact_candidate_url_entity_context(
             }
         )
     return compact
-
-
-def _build_candidate_entity_context_map(contexts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {
-        str(context.get("url")).strip().casefold(): context
-        for context in contexts
-        if isinstance(context, dict) and str(context.get("url") or "").strip()
-    }
-
-
-def _existing_entity_penalty(context: dict[str, Any]) -> int:
-    best_match = context.get("best_match", {})
-    completeness_level = str(best_match.get("completeness_level") or "sparse").casefold()
-    if completeness_level == "complete":
-        return 6
-    if completeness_level == "substantial":
-        return 3
-    return 1 if int(best_match.get("relation_count") or 0) >= 2 else 0
-
-
-def _should_skip_candidate_due_to_existing_entity(url: str, context: dict[str, Any]) -> bool:
-    best_match = context.get("best_match", {})
-    completeness_level = str(best_match.get("completeness_level") or "sparse").casefold()
-    if completeness_level != "complete":
-        return False
-    if _looks_like_fresh_fact_url(url):
-        return False
-    return _looks_like_entity_detail_url(url)
-
-
-def _looks_like_entity_detail_url(url: str) -> bool:
-    parsed = urlsplit(url)
-    segments = [segment for segment in unquote(parsed.path).casefold().split("/") if segment]
-    if not segments:
-        return False
-    last_segment = segments[-1]
-    if any(last_segment.endswith(ext) for ext in _STATIC_RESOURCE_EXTENSIONS):
-        return False
-    if last_segment in _ENTITY_DETAIL_GENERIC_SEGMENTS or len(last_segment) < 2:
-        return False
-    if any(segment in _ENTITY_DETAIL_PATH_HINTS for segment in segments[:-1]):
-        return True
-    return len(segments) <= 2 and not _looks_like_fresh_fact_url(url)
-
-
-def _looks_like_fresh_fact_url(url: str) -> bool:
-    decoded = _decode_url_for_matching(url)
-    return any(hint in decoded for hint in _FRESH_FACT_URL_HINTS)
-
-
 def _normalize_candidate_urls(urls: list[str]) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -814,58 +546,6 @@ PAGE_EXTRACTION_TEXT_LIMIT = 50000
 RELATED_URL_TEXT_LIMIT = 4000
 RELATED_URL_BATCH_SIZE = 80
 RELATED_URL_ENTITY_SUMMARY_LIMIT = 240
-
-_ENTITY_DETAIL_PATH_HINTS = {
-    "wiki",
-    "character",
-    "characters",
-    "resonator",
-    "resonators",
-    "weapon",
-    "weapons",
-    "echo",
-    "echoes",
-    "npc",
-    "monster",
-    "boss",
-    "location",
-    "locations",
-    "area",
-    "areas",
-    "faction",
-    "factions",
-}
-
-_ENTITY_DETAIL_GENERIC_SEGMENTS = {
-    "wiki",
-    "index",
-    "index.php",
-    "page",
-    "entry",
-    "detail",
-    "details",
-    "character",
-    "characters",
-    "resonator",
-    "resonators",
-    "weapon",
-    "weapons",
-    "echo",
-    "echoes",
-}
-
-_FRESH_FACT_URL_HINTS = (
-    "news",
-    "notice",
-    "announcement",
-    "update",
-    "patch",
-    "version",
-    "event",
-    "activity",
-    "preview",
-    "release",
-)
 
 
 def _truncate_for_llm(text: str, limit: int) -> str:
