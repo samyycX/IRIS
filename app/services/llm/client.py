@@ -810,7 +810,7 @@ def _batched(values: list[str], *, size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
-PAGE_EXTRACTION_TEXT_LIMIT = 12000
+PAGE_EXTRACTION_TEXT_LIMIT = 50000
 RELATED_URL_TEXT_LIMIT = 4000
 RELATED_URL_BATCH_SIZE = 80
 RELATED_URL_ENTITY_SUMMARY_LIMIT = 240

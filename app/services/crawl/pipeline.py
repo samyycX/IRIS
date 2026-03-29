@@ -6,8 +6,18 @@ from dataclasses import dataclass, field
 from time import monotonic
 
 from app.core.logging import get_logger
-from app.models import GraphUpdateResult, JobEvent, JobRequest, JobStage, JobStatus
-from app.repos.event_store import InMemoryEventStore
+from app.models import (
+    GraphUpdateResult,
+    JobCheckpoint,
+    JobEvent,
+    JobQueueItem,
+    JobRequest,
+    JobStage,
+    JobStatus,
+    JobSummary,
+    utcnow,
+)
+from app.repos.job_store import JobStore
 from app.repos.graph_repo import Neo4jGraphRepository
 from app.repos.url_history import UrlHistoryRepository
 from app.services.crawl.canonicalizer import URLCanonicalizer
@@ -20,7 +30,7 @@ logger = get_logger(__name__)
 class CrawlPipeline:
     def __init__(
         self,
-        event_store: InMemoryEventStore,
+        event_store: JobStore,
         graph_repo: Neo4jGraphRepository,
         url_history: UrlHistoryRepository,
         canonicalizer: URLCanonicalizer,
@@ -40,20 +50,32 @@ class CrawlPipeline:
         self._llm_timeout_seconds = llm_timeout_seconds
         self._skip_history_seen_urls = skip_history_seen_urls
 
-    async def run_job(self, job_id: str, request: JobRequest) -> GraphUpdateResult:
+    async def run_job(
+        self,
+        job_id: str,
+        request: JobRequest,
+        *,
+        checkpoint: JobCheckpoint | None = None,
+    ) -> GraphUpdateResult:
         started_at = monotonic()
         await self._event_store.set_status(job_id, JobStatus.running)
         await self._emit(
             job_id,
             JobStage.queued,
-            "任务已开始执行",
+            "任务继续执行" if checkpoint is not None else "任务已开始执行",
             data={
                 "input_type": request.input_type.value,
                 "seed": request.seed(),
+                "resume": checkpoint is not None,
             },
         )
         if request.url is not None:
-            return await self._run_url_job(job_id, request, started_at=started_at)
+            return await self._run_url_job(
+                job_id,
+                request,
+                started_at=started_at,
+                checkpoint=checkpoint,
+            )
         return await self._run_manual_job(job_id, request, started_at=started_at)
 
     async def _run_manual_job(
@@ -101,9 +123,9 @@ class CrawlPipeline:
                 extraction=extraction.model_dump(),
             )
         )
-        completed_job = await self._event_store.finish_job(job_id, JobStatus.completed, graph_update=result)
-        if completed_job is not None:
-            await self._graph_repo.sync_job(completed_job, request=request)
+        await self._event_store.update_job(job_id, graph_update=result, resume_available=False)
+        await self._event_store.save_checkpoint(job_id, None)
+        await self._event_store.finish_job(job_id, JobStatus.completed, graph_update=result)
         await self._emit(
             job_id,
             JobStage.completed,
@@ -117,7 +139,14 @@ class CrawlPipeline:
         )
         return result
 
-    async def _run_url_job(self, job_id: str, request: JobRequest, *, started_at: float) -> GraphUpdateResult:
+    async def _run_url_job(
+        self,
+        job_id: str,
+        request: JobRequest,
+        *,
+        started_at: float,
+        checkpoint: JobCheckpoint | None,
+    ) -> GraphUpdateResult:
         seed_url = self._canonicalizer.canonicalize(str(request.url))
         crawl_concurrency = (
             request.crawl_concurrency
@@ -127,15 +156,13 @@ class CrawlPipeline:
         job = await self._event_store.get_job(job_id)
         max_depth = job.max_depth if job is not None else (request.max_depth or 0)
         max_pages = job.max_pages if job is not None else (request.max_pages or 0)
-        state = _UrlJobState(
-            queue=deque([(seed_url, 0, None)]),
-            queued_urls={seed_url},
-        )
+        state = self._restore_url_job_state(seed_url=seed_url, checkpoint=checkpoint, job=job)
         await self._event_store.set_queue_size(job_id, len(state.queue))
+        await self._save_url_checkpoint(job_id=job_id, state=state)
         await self._emit(
             job_id,
             JobStage.discovering,
-            "已初始化 URL 抓取队列",
+            "已恢复 URL 抓取队列" if checkpoint is not None else "已初始化 URL 抓取队列",
             url=seed_url,
             data={
                 "seed_url": seed_url,
@@ -143,6 +170,8 @@ class CrawlPipeline:
                 "max_depth": max_depth,
                 "max_pages": max_pages,
                 "crawl_concurrency": crawl_concurrency,
+                "resume": checkpoint is not None,
+                "visited_count": state.visited_count,
             },
         )
 
@@ -170,13 +199,18 @@ class CrawlPipeline:
                 data={"visited_count": state.visited_count, "max_pages": max_pages},
             )
 
-        completed_job = await self._event_store.finish_job(
+        await self._event_store.save_checkpoint(job_id, None)
+        await self._event_store.update_job(
+            job_id,
+            graph_update=state.total_update,
+            resume_available=False,
+            completion_reason=state.completion_reason,
+        )
+        await self._event_store.finish_job(
             job_id,
             JobStatus.completed,
             graph_update=state.total_update,
         )
-        if completed_job is not None:
-            await self._graph_repo.sync_job(completed_job, request=request)
         await self._emit(
             job_id,
             JobStage.completed,
@@ -203,7 +237,9 @@ class CrawlPipeline:
             next_item = await self._claim_next_url(job_id=job_id, max_pages=max_pages, state=state)
             if next_item is None:
                 return
-            url, depth, referer, queue_remaining = next_item
+            item, queue_remaining = next_item
+            await self._save_url_checkpoint(job_id=job_id, state=state)
+            was_cancelled = False
             try:
                 await self._process_url(
                     job_id=job_id,
@@ -211,13 +247,22 @@ class CrawlPipeline:
                     seed_url=seed_url,
                     max_depth=max_depth,
                     state=state,
-                    url=url,
-                    depth=depth,
-                    referer=referer,
+                    item=item,
                     queue_remaining=queue_remaining,
                 )
+            except asyncio.CancelledError:
+                was_cancelled = True
+                async with state.condition:
+                    state.stop_requested = True
+                    state.completion_reason = "paused"
+                    state.processing_items[item.url] = item
+                    state.condition.notify_all()
+                await self._save_url_checkpoint(job_id=job_id, state=state)
+                raise
             finally:
-                await self._release_claim(state=state, url=url)
+                if not was_cancelled:
+                    await self._release_claim(state=state, url=item.url)
+                    await self._save_url_checkpoint(job_id=job_id, state=state)
 
     async def _claim_next_url(
         self,
@@ -225,7 +270,7 @@ class CrawlPipeline:
         job_id: str,
         max_pages: int,
         state: _UrlJobState,
-    ) -> tuple[str, int, str | None, int] | None:
+    ) -> tuple[JobQueueItem, int] | None:
         async with state.condition:
             while True:
                 if state.stop_requested:
@@ -246,20 +291,20 @@ class CrawlPipeline:
                     await state.condition.wait()
                     continue
                 if state.queue:
-                    url, depth, referer = state.queue.popleft()
-                    state.queued_urls.discard(url)
-                    state.processing_urls.add(url)
+                    item = state.queue.popleft()
+                    state.queued_urls.discard(item.url)
+                    state.processing_items[item.url] = item
                     state.active_claims += 1
                     queue_remaining = len(state.queue)
                     await self._event_store.set_queue_size(job_id, queue_remaining)
-                    return url, depth, referer, queue_remaining
+                    return item, queue_remaining
                 if state.active_claims == 0:
                     return None
                 await state.condition.wait()
 
     async def _release_claim(self, *, state: _UrlJobState, url: str) -> None:
         async with state.condition:
-            state.processing_urls.discard(url)
+            state.processing_items.pop(url, None)
             state.active_claims -= 1
             state.condition.notify_all()
 
@@ -274,6 +319,7 @@ class CrawlPipeline:
         if not remembered:
             return False
         async with state.condition:
+            state.visited_urls.add(canonical_url)
             state.visited_count += 1
             state.condition.notify_all()
         return True
@@ -291,14 +337,14 @@ class CrawlPipeline:
         skipped_count = 0
         async with state.condition:
             for canonical in discovered_urls:
-                if canonical in state.queued_urls or canonical in state.processing_urls:
+                if canonical in state.queued_urls or canonical in state.processing_items:
                     skipped_count += 1
                     continue
                 if await self._event_store.has_job_visited_url(job_id, canonical):
                     skipped_count += 1
                     continue
                 state.queued_urls.add(canonical)
-                state.queue.append((canonical, next_depth, referer))
+                state.queue.append(JobQueueItem(url=canonical, depth=next_depth, referer=referer))
                 queued_count += 1
             queue_size = len(state.queue)
             await self._event_store.set_queue_size(job_id, queue_size)
@@ -314,11 +360,12 @@ class CrawlPipeline:
         seed_url: str,
         max_depth: int,
         state: _UrlJobState,
-        url: str,
-        depth: int,
-        referer: str | None,
+        item: JobQueueItem,
         queue_remaining: int,
     ) -> None:
+        url = item.url
+        depth = item.depth
+        referer = item.referer
         await self._emit(
             job_id,
             JobStage.discovering,
@@ -479,6 +526,8 @@ class CrawlPipeline:
             )
             async with state.condition:
                 state.total_update = merge_graph_updates(state.total_update, update)
+            await self._event_store.update_job(job_id, graph_update=state.total_update)
+            await self._save_url_checkpoint(job_id=job_id, state=state)
             await self._emit(
                 job_id,
                 JobStage.updating_graph,
@@ -519,6 +568,7 @@ class CrawlPipeline:
                         "filter_candidate_urls": request.filter_candidate_urls,
                     },
                 )
+                await self._save_url_checkpoint(job_id=job_id, state=state)
         except Exception as exc:  # noqa: BLE001
             logger.exception("crawl_page_failed", job_id=job_id, url=url, error=str(exc))
             await self._event_store.increment_failed(job_id)
@@ -530,6 +580,7 @@ class CrawlPipeline:
                 url=url,
                 data={"error": str(exc), "page_elapsed_ms": _elapsed_ms(page_started_at)},
             )
+            await self._save_url_checkpoint(job_id=job_id, state=state)
 
     async def _emit(
         self,
@@ -558,6 +609,48 @@ class CrawlPipeline:
             data=payload,
         )
         await self._event_store.append_event(event)
+
+    def _restore_url_job_state(
+        self,
+        *,
+        seed_url: str,
+        checkpoint: JobCheckpoint | None,
+        job: JobSummary | None,
+    ) -> _UrlJobState:
+        if checkpoint is None:
+            return _UrlJobState(
+                queue=deque([JobQueueItem(url=seed_url, depth=0, referer=None)]),
+                queued_urls={seed_url},
+            )
+        queue_items = [item.model_copy(deep=True) for item in checkpoint.pending_queue]
+        queued_urls = {item.url for item in queue_items}
+        for item in checkpoint.in_progress:
+            if item.url in queued_urls:
+                continue
+            queue_items.append(item.model_copy(deep=True))
+            queued_urls.add(item.url)
+        total_update = job.graph_update.model_copy(deep=True) if job and job.graph_update else GraphUpdateResult()
+        return _UrlJobState(
+            queue=deque(queue_items),
+            queued_urls=queued_urls,
+            total_update=total_update,
+            visited_count=len(checkpoint.visited_urls),
+            visited_urls=set(checkpoint.visited_urls),
+            completion_reason=checkpoint.completion_reason or "queue_exhausted",
+        )
+
+    async def _save_url_checkpoint(self, *, job_id: str, state: _UrlJobState) -> None:
+        async with state.condition:
+            checkpoint = JobCheckpoint(
+                pending_queue=[item.model_copy(deep=True) for item in state.queue],
+                in_progress=[
+                    item.model_copy(deep=True) for item in state.processing_items.values()
+                ],
+                visited_urls=sorted(state.visited_urls),
+                completion_reason=state.completion_reason,
+                last_event_at=utcnow(),
+            )
+        await self._event_store.save_checkpoint(job_id, checkpoint)
 
     async def _filter_unseen_candidate_urls(
         self,
@@ -629,12 +722,13 @@ async def _await_with_timeout(coro, *, timeout_seconds: int, timeout_message: st
 
 @dataclass
 class _UrlJobState:
-    queue: deque[tuple[str, int, str | None]]
+    queue: deque[JobQueueItem]
     queued_urls: set[str]
-    processing_urls: set[str] = field(default_factory=set)
+    processing_items: dict[str, JobQueueItem] = field(default_factory=dict)
     total_update: GraphUpdateResult = field(default_factory=GraphUpdateResult)
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     active_claims: int = 0
     visited_count: int = 0
+    visited_urls: set[str] = field(default_factory=set)
     stop_requested: bool = False
     completion_reason: str = "queue_exhausted"

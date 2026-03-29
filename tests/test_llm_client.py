@@ -2,6 +2,7 @@ import json
 
 from app.core.config import Settings
 from app.models import ExtractedEntity
+from app.services.llm import EmbeddingClient
 from app.services.llm.client import LLMClient
 from app.services.llm.prompts import GENERIC_PAGE_EXTRACTION_PROMPT, PAGE_EXTRACTION_PROMPT
 
@@ -167,6 +168,31 @@ class _FakeOpenAIClient:
         self.chat = _FakeChat(completions)
 
 
+class _FakeEmbeddingResponseItem:
+    def __init__(self, embedding: list[float]) -> None:
+        self.embedding = embedding
+
+
+class _FakeEmbeddingResponse:
+    def __init__(self, data: list[list[float]]) -> None:
+        self.data = [_FakeEmbeddingResponseItem(item) for item in data]
+
+
+class _FakeEmbeddings:
+    def __init__(self, data: list[list[float]]) -> None:
+        self._data = data
+        self.requests: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return _FakeEmbeddingResponse(self._data)
+
+
+class _FakeEmbeddingOpenAIClient:
+    def __init__(self, embeddings: _FakeEmbeddings) -> None:
+        self.embeddings = embeddings
+
+
 async def test_extract_knowledge_truncates_text_before_sending_to_llm():
     client = LLMClient(Settings(openai_api_key="test-key"))
     completions = _FakeCompletions(['{"summary":"ok","extracted_entities":[]}'])
@@ -272,5 +298,25 @@ async def test_filter_related_urls_uses_context_and_preserves_llm_priority_order
     ]
     assert len(payload["text_excerpt"]) == 4000
     assert payload["text_excerpt"] == text[:4000]
+
+
+async def test_embedding_client_uses_dedicated_embedding_configuration():
+    client = EmbeddingClient(
+        Settings(
+            openai_embedding_api_key="embedding-key",
+            openai_embedding_base_url="https://emb.example.com/v1",
+            openai_embedding_model="mebedding-large",
+            embedding_dimensions=1024,
+        )
+    )
+    embeddings = _FakeEmbeddings([[0.1, 0.2, 0.3]])
+    client._client = _FakeEmbeddingOpenAIClient(embeddings)
+
+    vector = await client.embed_text("示例摘要")
+
+    assert vector == [0.1, 0.2, 0.3]
+    assert embeddings.requests[0]["model"] == "mebedding-large"
+    assert embeddings.requests[0]["input"] == ["示例摘要"]
+    assert embeddings.requests[0]["dimensions"] == 1024
 
 

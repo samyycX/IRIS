@@ -12,7 +12,7 @@
 
 ## 1. 项目一句话说明
 
-这是一个面向通用知识图谱构建的 Python 单体应用。它支持从 URL、文本指令或实体名发起任务，自动抓取网页、抽取正文、调用 OpenAI 兼容 LLM 生成结构化知识，并把页面、实体、关系写入 Neo4j，同时记录任务日志、事件流、URL 去重状态和实时进度。当前默认 `PROMPT_PROFILE=wuwa`，因此默认提示词行为仍保持与历史项目一致。
+这是一个面向通用知识图谱构建的 Python 单体应用。它支持从 URL、文本指令或实体名发起任务，自动抓取网页、抽取正文、调用 OpenAI 兼容 LLM 生成结构化知识，并把页面、实体、关系写入 Neo4j，同时把任务状态、事件流、checkpoint 和图谱更新摘要持久化到 Neo4j `CrawlJob`。当前默认 `PROMPT_PROFILE=wuwa`，因此默认提示词行为仍保持与历史项目一致。
 
 ---
 
@@ -22,6 +22,7 @@
 - 抓取层：`httpx` + `Playwright` + `BeautifulSoup` + `trafilatura`
 - LLM 层：`openai` Python SDK，兼容 OpenAI 风格接口
 - 图数据库：`Neo4j`
+- 图迁移：启动时自动执行 `app/repos/migrations/*.cypher`
 - 去重持久化：本地 JSON 文件 `VISITED_URLS_FILE`，记录访问时间并默认按最近 `10` 天窗口判重
 - 后台任务：进程内异步任务
 - 日志：`structlog`
@@ -38,11 +39,13 @@
 3. `app/services/crawl/pipeline.py`
 4. `app/services/jobs.py`
 5. `app/repos/graph_repo.py`
-6. `app/services/llm/client.py`
-7. `app/services/tools/builtins.py`
-8. `app/web/routes.py` 和 `app/api/routes.py`
-9. `app/models/jobs.py`
-10. `AI_ONBOARDING_SUMMARY.md` 本文件作为导航
+6. `app/repos/neo4j_job_store.py`
+7. `app/repos/graph_migrations.py`
+8. `app/services/llm/client.py`
+9. `app/services/tools/builtins.py`
+10. `app/web/routes.py` 和 `app/api/routes.py`
+11. `app/models/jobs.py`
+12. `AI_ONBOARDING_SUMMARY.md` 本文件作为导航
 
 ---
 
@@ -62,7 +65,7 @@
   - 让 LLM 结合页面内容、图谱上下文，以及候选链接在图谱中的实体完备度筛选关联链接，并按重要度排序后继续加入队列
    - 调用 `upsert_kg_entity` 写入 Neo4j
    - 持续递归抓取，直到达到深度或页面数量上限
-5. `app/repos/event_store.py` 记录阶段事件和任务状态。
+5. `app/repos/neo4j_job_store.py` 持久化任务状态、事件、checkpoint 和恢复信息。
 6. `app/api/routes.py` 的 SSE 接口把实时进度推给任务详情页。
 
 ### 4.2 手工输入任务流
@@ -82,6 +85,7 @@
 
 - 配置对象
 - Neo4j 仓库
+- Neo4j 迁移管理器
 - URL 历史文件仓库
 - 抓取器、抽取器、链接发现器
 - LLM 客户端和编排器
@@ -97,6 +101,7 @@
 - 创建任务
 - 调度本地异步执行
 - 提供任务查询
+- 提供手动 resume
 - 提供 SSE 事件流
 
 它不做抓取和抽取细节，这些都在 `CrawlPipeline`。
@@ -191,9 +196,11 @@
 - 服务装配中心，负责创建项目所有核心组件。
 - 应用启动时会：
   - 初始化图仓库
+  - 执行 Neo4j `.cypher` 迁移
   - 初始化 URL 历史文件仓库
   - 注册 Tool
   - 确保 Neo4j 约束存在
+  - 将上次异常中断但仍显示 `queued/running` 的任务转为 `interrupted`
 - 如果以后要换 URL 历史存储、换图数据库、加入新工具，这里是最关键的接入点。
 
 ---
@@ -211,6 +218,7 @@
   - `JobRequest`：任务创建输入
   - `JobSummary`：任务整体状态
   - `JobEvent`：事件流单条记录
+  - `JobQueueItem` / `JobCheckpoint`：URL 任务恢复所需的 checkpoint 结构
   - `CrawlPageResult`：网页抓取和正文抽取结果
   - `ExtractedEntity`：LLM 输出的实体对象
   - `PageExtraction`：页面级结构化抽取结果
@@ -234,6 +242,7 @@
   - `POST /api/jobs`：创建任务
   - `GET /api/jobs`：列出任务
   - `GET /api/jobs/{job_id}`：获取任务状态
+  - `POST /api/jobs/{job_id}/resume`：手动继续中断任务
   - `GET /api/jobs/{job_id}/events`：获取完整事件列表
   - `GET /api/jobs/{job_id}/stream`：SSE 实时事件流
 
@@ -258,17 +267,35 @@
 
 #### `app/repos/event_store.py`
 
-- 当前任务状态与事件流的内存实现。
+- 当前任务状态与事件流的抽象接口 `JobStore`，以及测试用内存实现 `InMemoryEventStore`。
 - 维护：
   - 任务摘要
   - 原始请求
   - 事件列表
   - 每个任务访问过的 URL
   - 全局访问过的 URL
-- 这是当前“进度页可见状态”的事实来源。
-- Neo4j 里的 `CrawlJob` 现在会在任务开始和任务结束时同步一次最终结果快照，用于持久化任务 summary、统计信息和详细修改记录；运行中的实时状态仍以这里为准。
+- 主要用于测试和接口抽象，不再是生产环境的事实来源。
 
-注意：它目前是内存实现，服务重启后会丢失。未来如果要持久化任务日志，应先替换这里。
+#### `app/repos/neo4j_job_store.py`
+
+- 当前生产环境使用的任务状态仓库。
+- 以 Neo4j `CrawlJob` 为事实来源，负责：
+  - 创建和列出任务
+  - 更新 `status / visited_count / queued_count / failed_count / last_error`
+  - 持久化 `request_json / events_json / checkpoint_json / visited_urls_json`
+  - 标记 `resume_available`
+  - 读取 checkpoint 并支持手动续跑
+- 旧版 `CrawlJob` 节点缺字段时，这里也会做兼容兜底读取，避免接口直接 500。
+
+#### `app/repos/graph_migrations.py`
+
+- Neo4j 图数据迁移管理器。
+- 启动时扫描 `app/repos/migrations/` 下的 `.cypher` 文件并按版本执行。
+- 迁移文件命名格式：`V<number>__name.cypher`
+- 迁移状态和历史记录写入 Neo4j：
+  - `MigrationState`
+  - `MigrationRecord`
+- 这套机制不只服务于 `CrawlJob`，所有节点、关系、索引或补数据脚本都应该优先走这里。
 
 #### `app/repos/url_history.py`
 
@@ -336,6 +363,7 @@
   - 深度限制和页面数量限制
   - 本任务去重和历史去重
   - 发出阶段事件
+  - 持续把队列、处理中 URL、visited 集合和总图谱变更写回 checkpoint
   - 调用 Tool 抓取网页
   - 调用 LLM 做总结、抽取与关联链接排序
   - 按排序结果入队新发现链接
@@ -458,6 +486,7 @@
   - 写入初始事件
   - 调度本地异步任务
   - 提供任务查询
+  - 提供 `resume_job()`
   - 通过 `stream_events()` 提供 SSE 数据源
 
 如果未来要加取消任务、重试任务、任务优先级，这里是第一修改点。
@@ -512,17 +541,19 @@
 - URL 抓取、正文抽取、链接发现
 - LLM 结构化抽取
 - Neo4j 基本写入
+- Neo4j 持久化任务状态、事件与 checkpoint
+- 手动断点续跑
+- Neo4j 文件迁移系统
 - 文件型 URL 历史判重
 - 任务事件流与 SSE 进度展示
 
 ### 仍然偏 MVP 的部分
 
-- `event_store` 还是内存实现，重启会丢任务历史
 - `LLMClient` fallback 很简单
 - 已支持通过 `ENABLE_PLAYWRIGHT=true` 启用浏览器级动态页面抓取
 - 没有更强的实体对齐策略
 - 没有显式置信度评分
-- 没有任务取消、恢复、暂停
+- 没有任务取消、暂停
 - 没有更细的站点适配器
 
 ---
@@ -540,8 +571,9 @@
 ### 如果要改图谱结构
 
 1. 先改 `app/models/jobs.py` 中相关数据模型。
-2. 再改 `app/repos/graph_repo.py` 的写入 Cypher。
-3. 如果需要新业务规则，再改 `app/services/kg/service.py`。
+2. 如果需要改已有图数据，新增 `app/repos/migrations/V<number>__name.cypher`。
+3. 再改 `app/repos/graph_repo.py` 的写入 Cypher。
+4. 如果需要新业务规则，再改 `app/services/kg/service.py`。
 
 ### 如果要增强爬虫
 
@@ -556,6 +588,13 @@
 2. `frontend/src/components/ui/`
 3. `frontend/src/i18n.ts`
 4. 运行 `npm run build` 重新打包静态资源
+
+### 如果要新增 Neo4j migration
+
+1. 在 `app/repos/migrations/` 新增版本更高的 `.cypher` 文件。
+2. 文件名必须符合 `V<number>__name.cypher`。
+3. 不要修改已执行过的历史 migration。
+4. 通过 `python -m app.main` 启动时自动执行，并检查 `MigrationRecord` 是否写入。
 
 ---
 
@@ -581,7 +620,6 @@ pip install -e .[dev]
 
 这个项目目前最适合沿着“保留单体结构，但把业务规则继续往服务层和 Tool 层拆”这个方向演进。不要急着引入复杂框架，先把：
 
-- 任务事件持久化
 - 更强的实体对齐
 - 更可靠的站点适配
 - 更完整的测试

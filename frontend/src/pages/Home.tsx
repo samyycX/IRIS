@@ -37,6 +37,7 @@ interface Job {
   status: string
   visited_count: number
   failed_count: number
+  resume_available: boolean
 }
 
 export default function Home() {
@@ -53,11 +54,20 @@ export default function Home() {
   const [concurrency, setConcurrency] = useState('5')
   const [filterUrls, setFilterUrls] = useState(true)
 
+  const loadJobs = async () => {
+    try {
+      const res = await fetch('/api/jobs')
+      const data = await res.json()
+      if (Array.isArray(data)) {
+        setJobs(data)
+      }
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
   useEffect(() => {
-    fetch('/api/jobs')
-      .then(res => res.json())
-      .then(data => setJobs(data))
-      .catch(console.error)
+    loadJobs()
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -86,6 +96,60 @@ export default function Home() {
     } catch (err) {
       console.error(err)
     }
+  }
+
+  const handleResume = async (jobId: string) => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/resume`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        throw new Error(`Resume failed: ${res.status}`)
+      }
+      await loadJobs()
+      navigate(`/jobs/${jobId}`)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const handlePause = async (jobId: string) => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/pause`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        throw new Error(`Pause failed: ${res.status}`)
+      }
+      await loadJobs()
+      navigate(`/jobs/${jobId}`)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const handleCancel = async (jobId: string) => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/cancel`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        throw new Error(`Cancel failed: ${res.status}`)
+      }
+      await loadJobs()
+      navigate(`/jobs/${jobId}`)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const getStatusVariant = (status: string) => {
+    if (status === 'completed') return 'default'
+    if (status === 'failed') return 'destructive'
+    if (status === 'cancelled') return 'destructive'
+    if (status === 'paused') return 'outline'
+    if (status === 'interrupted') return 'outline'
+    return 'secondary'
   }
 
   return (
@@ -173,6 +237,7 @@ export default function Home() {
                     <TableHead>{t('Status')}</TableHead>
                     <TableHead className="text-right">{t('Visited')}</TableHead>
                     <TableHead className="text-right">{t('Failed')}</TableHead>
+                    <TableHead className="text-right">{t('Actions')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -186,12 +251,36 @@ export default function Home() {
                       <TableCell>{job.input_type}</TableCell>
                       <TableCell className="max-w-[200px] truncate" title={job.seed}>{job.seed}</TableCell>
                       <TableCell>
-                        <Badge variant={job.status === 'completed' ? 'default' : job.status === 'failed' ? 'destructive' : 'secondary'}>
+                        <Badge variant={getStatusVariant(job.status)}>
                           {job.status}
                         </Badge>
                       </TableCell>
                       <TableCell className="text-right">{job.visited_count}</TableCell>
                       <TableCell className="text-right">{job.failed_count}</TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex justify-end gap-2">
+                        {job.status === 'queued' || job.status === 'running' ? (
+                          <Button variant="outline" size="sm" onClick={() => handlePause(job.job_id)}>
+                            {t('Pause')}
+                          </Button>
+                        ) : null}
+                        {job.status !== 'completed' && job.status !== 'cancelled' ? (
+                          <Button variant="destructive" size="sm" onClick={() => handleCancel(job.job_id)}>
+                            {t('Cancel')}
+                          </Button>
+                        ) : null}
+                        {job.resume_available && (job.status === 'interrupted' || job.status === 'failed') ? (
+                          <Button variant="outline" size="sm" onClick={() => handleResume(job.job_id)}>
+                            {t('Resume')}
+                          </Button>
+                        ) : null}
+                        {job.resume_available && job.status === 'paused' ? (
+                          <Button variant="outline" size="sm" onClick={() => handleResume(job.job_id)}>
+                            {t('Resume')}
+                          </Button>
+                        ) : null}
+                        </div>
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>

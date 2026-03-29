@@ -4,12 +4,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.models import JobEvent, JobInputType, JobRequest, JobStage, JobStatus
-from app.repos.event_store import InMemoryEventStore
+from app.repos.job_store import InMemoryJobStore
 
 
 @pytest.mark.asyncio
 async def test_wait_for_event_returns_after_new_event_is_appended():
-    store = InMemoryEventStore()
+    store = InMemoryJobStore()
     job = await store.create_job(
         JobRequest(input_type=JobInputType.entity, entity_name="角色甲"),
         max_depth=1,
@@ -30,7 +30,7 @@ async def test_wait_for_event_returns_after_new_event_is_appended():
 
 @pytest.mark.asyncio
 async def test_wait_for_event_returns_when_job_becomes_terminal():
-    store = InMemoryEventStore()
+    store = InMemoryJobStore()
     job = await store.create_job(
         JobRequest(input_type=JobInputType.entity, entity_name="角色丁"),
         max_depth=1,
@@ -47,7 +47,7 @@ async def test_wait_for_event_returns_when_job_becomes_terminal():
 @pytest.mark.asyncio
 async def test_global_seen_urls_expire_after_ttl():
     current = datetime(2026, 3, 29, tzinfo=timezone.utc)
-    store = InMemoryEventStore(
+    store = InMemoryJobStore(
         global_seen_ttl_days=10,
         now_provider=lambda: current,
     )

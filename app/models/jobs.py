@@ -21,9 +21,11 @@ class JobInputType(str, Enum):
 class JobStatus(str, Enum):
     queued = "queued"
     running = "running"
+    paused = "paused"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
+    interrupted = "interrupted"
 
 
 class JobStage(str, Enum):
@@ -35,6 +37,7 @@ class JobStage(str, Enum):
     updating_graph = "updating_graph"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class ExtractedEntity(BaseModel):
@@ -99,6 +102,21 @@ class JobEvent(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class JobQueueItem(BaseModel):
+    url: str
+    depth: int
+    referer: str | None = None
+
+
+class JobCheckpoint(BaseModel):
+    pending_queue: list[JobQueueItem] = Field(default_factory=list)
+    in_progress: list[JobQueueItem] = Field(default_factory=list)
+    visited_urls: list[str] = Field(default_factory=list)
+    completion_reason: str | None = None
+    last_event_at: datetime | None = None
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class JobSummary(BaseModel):
     job_id: str
     input_type: JobInputType
@@ -114,6 +132,9 @@ class JobSummary(BaseModel):
     failed_count: int = 0
     last_error: str | None = None
     graph_update: GraphUpdateResult | None = None
+    resume_available: bool = False
+    checkpoint_updated_at: datetime | None = None
+    completion_reason: str | None = None
 
 
 class CrawlContext(BaseModel):

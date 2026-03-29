@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from app.core.config import Settings
-from app.repos import InMemoryEventStore, Neo4jGraphRepository, UrlHistoryRepository
+from app.repos import (
+    Neo4jGraphRepository,
+    Neo4jJobStore,
+    Neo4jMigrationManager,
+    Neo4jVectorIndexJobStore,
+    UrlHistoryRepository,
+)
 from app.services.crawl import (
     ContentExtractor,
     CrawlPipeline,
@@ -11,7 +17,7 @@ from app.services.crawl import (
 )
 from app.services.jobs import JobService
 from app.services.kg import KnowledgeGraphService
-from app.services.llm import LLMClient, LlmOrchestrator
+from app.services.llm import EmbeddingClient, LLMClient, LlmOrchestrator
 from app.services.tools import (
     DiscoverLinksTool,
     ExtractMainContentTool,
@@ -21,14 +27,18 @@ from app.services.tools import (
     ToolRegistry,
     UpsertKgEntityTool,
 )
+from app.services.vector_index import VectorIndexService
 
 
 class ServiceContainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-        self.event_store = InMemoryEventStore(settings.visited_url_ttl_days)
-        self.graph_repo = Neo4jGraphRepository(settings)
+        self.event_store = Neo4jJobStore(settings)
+        self.embedding_client = EmbeddingClient(settings)
+        self.graph_repo = Neo4jGraphRepository(settings, embedding_client=self.embedding_client)
+        self.migrations = Neo4jMigrationManager(settings)
+        self.vector_index_job_store = Neo4jVectorIndexJobStore(settings)
 
         self.canonicalizer = URLCanonicalizer()
         self.fetcher = HttpFetcher(settings)
@@ -59,7 +69,13 @@ class ServiceContainer:
             llm_timeout_seconds=settings.llm_timeout_seconds,
             skip_history_seen_urls=settings.skip_history_seen_urls,
         )
-        self.jobs = JobService(settings, self.event_store, self.graph_repo, self.pipeline)
+        self.jobs = JobService(settings, self.event_store, self.pipeline)
+        self.vector_index = VectorIndexService(
+            settings=settings,
+            graph_repo=self.graph_repo,
+            embedding_client=self.embedding_client,
+            job_store=self.vector_index_job_store,
+        )
 
     async def initialize(self) -> None:
         self.url_history = UrlHistoryRepository(
@@ -81,13 +97,24 @@ class ServiceContainer:
             llm_timeout_seconds=self.settings.llm_timeout_seconds,
             skip_history_seen_urls=self.settings.skip_history_seen_urls,
         )
-        self.jobs = JobService(self.settings, self.event_store, self.graph_repo, self.pipeline)
+        self.jobs = JobService(self.settings, self.event_store, self.pipeline)
+        self.vector_index = VectorIndexService(
+            settings=self.settings,
+            graph_repo=self.graph_repo,
+            embedding_client=self.embedding_client,
+            job_store=self.vector_index_job_store,
+        )
         self._register_tools()
         await self.graph_repo.ensure_constraints()
+        await self.migrations.run_migrations()
+        await self.jobs.mark_interrupted_jobs()
+        await self.vector_index.initialize()
 
     async def close(self) -> None:
+        await self.vector_index.shutdown()
         await self.jobs.shutdown()
         await self.fetcher.close()
+        await self.migrations.close()
         await self.graph_repo.close()
 
     def _register_tools(self) -> None:

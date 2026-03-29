@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
 
 from neo4j import AsyncGraphDatabase
@@ -12,19 +12,37 @@ from neo4j.exceptions import Neo4jError
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models import (
+    EmbeddingCandidate,
+    EmbeddingQueryResult,
+    EmbeddingSourceType,
     ExtractedEntity,
     GraphUpdateResult,
     JobRequest,
     JobSummary,
     PageExtraction,
+    utcnow,
 )
+from app.models.vector_index import VectorIndexScope
+from app.services.llm.embedding_utils import (
+    build_embedding_key,
+    build_entity_embedding_text,
+    build_page_embedding_text,
+    build_relation_embedding_text,
+    build_relation_pair_key,
+    compute_embedding_content_hash,
+    parse_relation_pair_key,
+)
+
+if TYPE_CHECKING:
+    from app.services.llm import EmbeddingClient
 
 logger = get_logger(__name__)
 
 
 class Neo4jGraphRepository:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, embedding_client: EmbeddingClient | None = None) -> None:
         self._settings = settings
+        self._embedding_client = embedding_client
         self._driver = None
         self.enabled = bool(
             settings.neo4j_uri and settings.neo4j_username and settings.neo4j_password
@@ -59,6 +77,10 @@ class Neo4jGraphRepository:
             (
                 "CREATE CONSTRAINT entity_entity_id IF NOT EXISTS "
                 "FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE"
+            ),
+            (
+                "CREATE CONSTRAINT embedding_embedding_key IF NOT EXISTS "
+                "FOR (e:Embedding) REQUIRE e.embedding_key IS UNIQUE"
             ),
         ]
         async with self._driver.session() as session:
@@ -99,8 +121,31 @@ class Neo4jGraphRepository:
             return []
         await self.connect()
         async with self._driver.session() as session:
-            result = await session.run(_ENTITY_CONTEXT_CYPHER, search_text=query, limit=limit)
-            return [_enrich_entity_context_record(record.data()) async for record in result]
+            keyword_result = await session.run(_ENTITY_CONTEXT_CYPHER, search_text=query, limit=limit)
+            keyword_matches = [
+                _enrich_entity_context_record(record.data()) async for record in keyword_result
+            ]
+
+            if not self._embedding_client or not self._embedding_client.enabled:
+                return keyword_matches
+
+            try:
+                query_embedding = await self._embedding_client.embed_text(query.strip())
+                vector_result = await session.run(
+                    _ENTITY_VECTOR_CONTEXT_CYPHER,
+                    index_name=self._settings.neo4j_embedding_index_name,
+                    query_embedding=query_embedding,
+                    limit=limit,
+                    source_type=EmbeddingSourceType.entity.value,
+                )
+                vector_matches = [
+                    _enrich_entity_context_record(record.data()) async for record in vector_result
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("entity_vector_query_failed", query=query, error=str(exc))
+                return keyword_matches
+
+            return _merge_entity_context_matches(keyword_matches, vector_matches, limit=limit)
 
     async def query_related_url_entity_context(
         self,
@@ -145,6 +190,67 @@ class Neo4jGraphRepository:
                     }
                 )
         return contexts
+
+    async def query_similar_pages(self, query: str, limit: int = 5) -> list[EmbeddingQueryResult]:
+        if (
+            not self.enabled
+            or not query.strip()
+            or not self._embedding_client
+            or not self._embedding_client.enabled
+        ):
+            return []
+        await self.connect()
+        query_embedding = await self._embedding_client.embed_text(query.strip())
+        async with self._driver.session() as session:
+            result = await session.run(
+                _PAGE_VECTOR_QUERY_CYPHER,
+                index_name=self._settings.neo4j_embedding_index_name,
+                query_embedding=query_embedding,
+                limit=limit,
+                source_type=EmbeddingSourceType.page.value,
+            )
+            return [
+                EmbeddingQueryResult(
+                    source_type=EmbeddingSourceType.page,
+                    source_key=str(record["source_key"]),
+                    score=float(record["score"]),
+                    title=record.get("title"),
+                    summary=record.get("summary"),
+                )
+                async for record in result
+            ]
+
+    async def query_similar_relations(self, query: str, limit: int = 5) -> list[EmbeddingQueryResult]:
+        if (
+            not self.enabled
+            or not query.strip()
+            or not self._embedding_client
+            or not self._embedding_client.enabled
+        ):
+            return []
+        await self.connect()
+        query_embedding = await self._embedding_client.embed_text(query.strip())
+        async with self._driver.session() as session:
+            result = await session.run(
+                _RELATION_VECTOR_QUERY_CYPHER,
+                index_name=self._settings.neo4j_embedding_index_name,
+                query_embedding=query_embedding,
+                limit=limit,
+                source_type=EmbeddingSourceType.relation.value,
+            )
+            return [
+                EmbeddingQueryResult(
+                    source_type=EmbeddingSourceType.relation,
+                    source_key=str(record["source_key"]),
+                    score=float(record["score"]),
+                    left_entity_id=record.get("left_entity_id"),
+                    right_entity_id=record.get("right_entity_id"),
+                    left_entity_name=record.get("left_entity_name"),
+                    right_entity_name=record.get("right_entity_name"),
+                    aggregated_text=record.get("aggregated_text"),
+                )
+                async for record in result
+            ]
 
     async def query_entity_merge_candidates(
         self,
@@ -222,10 +328,15 @@ class Neo4jGraphRepository:
 
         try:
             async with self._driver.session() as session:
+                page_target_hash = _build_page_embedding_target_hash(
+                    summary=extraction.summary,
+                    version=self._settings.embedding_version,
+                )
                 await session.execute_write(
                     self._upsert_page_tx,
                     job_id,
                     extraction,
+                    page_target_hash,
                 )
                 for entity in extraction.extracted_entities:
                     entity_update = await session.execute_write(
@@ -239,6 +350,7 @@ class Neo4jGraphRepository:
                         update.updated_entities.append(entity.name)
                     update.created_relationships += entity_update["created_relationships"]
                     update.deleted_relationships += entity_update["deleted_relationships"]
+                    await self.refresh_entity_embedding_target(entity_update["entity_id"])
                 await session.execute_write(
                     self._update_visited_relation_tx,
                     job_id=job_id,
@@ -258,6 +370,140 @@ class Neo4jGraphRepository:
         if not page_was_present:
             update.created_pages.append(extraction.canonical_url)
         return update
+
+    async def refresh_entity_embedding_target(self, entity_id: str) -> str | None:
+        if not self.enabled:
+            return None
+        await self.connect()
+        async with self._driver.session() as session:
+            payload = await session.execute_read(self._get_entity_embedding_source_tx, entity_id)
+            if payload is None:
+                return None
+            embedding_text = build_entity_embedding_text(
+                name=str(payload.get("name") or ""),
+                category=str(payload.get("category") or "unknown"),
+                summary=str(payload.get("summary") or ""),
+                aliases=payload.get("aliases", []),
+                outgoing_relations=payload.get("outgoing_relations", []),
+                incoming_relations=payload.get("incoming_relations", []),
+                mentioned_in_pages=payload.get("mentioned_in_pages", []),
+                text_max_chars=self._settings.embedding_text_max_chars,
+            )
+            target_hash = compute_embedding_content_hash(
+                version=self._settings.embedding_version,
+                text=embedding_text,
+            )
+            await session.execute_write(
+                self._mark_entity_embedding_target_tx,
+                entity_id=entity_id,
+                target_hash=target_hash,
+            )
+            return target_hash
+
+    async def list_embedding_candidates(
+        self,
+        scope: VectorIndexScope,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str] | None = None,
+    ) -> list[EmbeddingCandidate]:
+        if not self.enabled:
+            return []
+        exclude_source_keys = exclude_source_keys or []
+        candidates: list[EmbeddingCandidate] = []
+        if scope in {VectorIndexScope.entity, VectorIndexScope.all}:
+            candidates.extend(
+                await self._list_entity_embedding_candidates(
+                    limit=limit,
+                    reindex=reindex,
+                    exclude_source_keys=exclude_source_keys,
+                )
+            )
+        if scope in {VectorIndexScope.page, VectorIndexScope.all} and len(candidates) < limit:
+            candidates.extend(
+                await self._list_page_embedding_candidates(
+                    limit=limit - len(candidates),
+                    reindex=reindex,
+                    exclude_source_keys=exclude_source_keys,
+                )
+            )
+        if scope in {VectorIndexScope.relation, VectorIndexScope.all} and len(candidates) < limit:
+            candidates.extend(
+                await self._list_relation_embedding_candidates(
+                    limit=limit - len(candidates),
+                    reindex=reindex,
+                    exclude_source_keys=exclude_source_keys,
+                )
+            )
+        return candidates[:limit]
+
+    async def upsert_embeddings(
+        self,
+        records: list[EmbeddingCandidate],
+        embeddings: list[list[float]],
+    ) -> None:
+        if not self.enabled or not records:
+            return
+        if len(records) != len(embeddings):
+            raise ValueError("Embedding records and vectors must have the same length.")
+        await self.connect()
+        payload = [
+            (
+                {
+                    "embedding_key": record.embedding_key,
+                    "source_type": record.source_type.value,
+                    "source_key": record.source_key,
+                    "content_hash": record.target_hash,
+                    "embedding": vector,
+                    "embedding_model": self._settings.openai_embedding_model,
+                    "embedding_dim": len(vector),
+                    "embedding_version": self._settings.embedding_version,
+                    "updated_at": utcnow().isoformat(),
+                }
+                | (
+                    {
+                        "left_entity_id": parse_relation_pair_key(record.source_key)[0],
+                        "right_entity_id": parse_relation_pair_key(record.source_key)[1],
+                        "aggregated_text": record.input_text,
+                    }
+                    if record.source_type == EmbeddingSourceType.relation
+                    else {}
+                )
+            )
+            for record, vector in zip(records, embeddings, strict=True)
+        ]
+        async with self._driver.session() as session:
+            await session.execute_write(self._upsert_embeddings_tx, payload)
+
+    async def mark_embedding_failed(self, record: EmbeddingCandidate, error: str) -> None:
+        if not self.enabled:
+            return
+        await self.connect()
+        async with self._driver.session() as session:
+            await session.execute_write(
+                self._mark_embedding_failed_tx,
+                source_type=record.source_type.value,
+                source_key=record.source_key,
+                error=error,
+            )
+
+    async def query_preview(
+        self,
+        query: str,
+        *,
+        entity_limit: int,
+        page_limit: int,
+        relation_limit: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "entities": await self.query_entity_context(query, limit=entity_limit),
+            "pages": [result.model_dump(mode="json") for result in await self.query_similar_pages(query, limit=page_limit)],
+            "relations": [
+                result.model_dump(mode="json")
+                for result in await self.query_similar_relations(query, limit=relation_limit)
+            ],
+        }
 
     @staticmethod
     async def _upsert_job_tx(tx, payload: dict[str, Any]) -> None:
@@ -294,17 +540,37 @@ class Neo4jGraphRepository:
         )
 
     @staticmethod
-    async def _upsert_page_tx(tx, job_id: str, extraction: PageExtraction) -> None:
+    async def _upsert_page_tx(
+        tx,
+        job_id: str,
+        extraction: PageExtraction,
+        page_target_hash: str,
+    ) -> None:
         query = """
         MERGE (job:CrawlJob {job_id: $job_id})
         ON CREATE SET job.started_at = datetime(),
                       job.created_at = datetime()
         MERGE (page:Page {canonical_url: $canonical_url})
+        WITH job, page
+        OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})-[:EMBEDS]->(page)
         SET page.title = $title,
             page.summary = $summary,
             page.content_hash = $content_hash,
             page.fetched_at = datetime(),
-            page.raw_text_excerpt = $raw_text_excerpt
+            page.updated_at = datetime(),
+            page.created_at = coalesce(page.created_at, datetime()),
+            page.raw_text_excerpt = $raw_text_excerpt,
+            page.embedding_target_hash = $page_target_hash,
+            page.embedding_last_error = CASE
+                WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $page_target_hash
+                THEN page.embedding_last_error
+                ELSE null
+            END,
+            page.embedding_last_dirty_at = CASE
+                WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $page_target_hash
+                THEN page.embedding_last_dirty_at
+                ELSE datetime()
+            END
         MERGE (job)-[:VISITED]->(page)
         """
         await tx.run(
@@ -315,6 +581,8 @@ class Neo4jGraphRepository:
             summary=extraction.summary,
             content_hash=extraction.content_hash,
             raw_text_excerpt=extraction.raw_text_excerpt,
+            page_target_hash=page_target_hash,
+            embedding_key=build_embedding_key(EmbeddingSourceType.page, extraction.canonical_url),
         )
 
         for discovered_url in extraction.discovered_urls:
@@ -492,6 +760,7 @@ class Neo4jGraphRepository:
 
         return {
             "created": created,
+            "entity_id": canonical_entity_id,
             "created_relationships": created_relationships,
             "deleted_relationships": deleted_relationships,
         }
@@ -560,7 +829,9 @@ class Neo4jGraphRepository:
                 entity.normalized_name = $normalized_name,
                 entity.category = $category,
                 entity.summary = $summary,
-                entity.aliases = $aliases
+                entity.aliases = $aliases,
+                entity.updated_at = datetime(),
+                entity.created_at = coalesce(entity.created_at, datetime())
             MERGE (entity)-[:MENTIONED_IN]->(page)
             """,
             canonical_url=canonical_url,
@@ -622,6 +893,20 @@ class Neo4jGraphRepository:
         )
         await tx.run(
             """
+            MATCH (embedding:Embedding {source_type: 'entity', source_key: $duplicate_entity_id})
+            DETACH DELETE embedding
+            """,
+            duplicate_entity_id=duplicate_entity_id,
+        )
+        await tx.run(
+            """
+            MATCH (embedding:RelationEmbedding)-[:EMBEDS]->(:Entity {entity_id: $duplicate_entity_id})
+            DETACH DELETE embedding
+            """,
+            duplicate_entity_id=duplicate_entity_id,
+        )
+        await tx.run(
+            """
             MATCH (duplicate:Entity {entity_id: $duplicate_entity_id})
             DETACH DELETE duplicate
             """,
@@ -675,7 +960,326 @@ class Neo4jGraphRepository:
             relation_type=relation_type,
         )
         record = await result.single()
+        await tx.run(
+            """
+            MATCH (left:Entity {entity_id: $left_entity_id})
+            MATCH (right:Entity {entity_id: $right_entity_id})
+            OPTIONAL MATCH (left)-[remaining:RELATED_TO]-(right)
+            WITH count(remaining) AS remaining_count
+            MATCH (embedding:RelationEmbedding {embedding_key: $embedding_key})
+            WHERE remaining_count = 0
+            DETACH DELETE embedding
+            """,
+            left_entity_id=min(source_entity_id, target_entity_id),
+            right_entity_id=max(source_entity_id, target_entity_id),
+            embedding_key=build_embedding_key(
+                EmbeddingSourceType.relation,
+                build_relation_pair_key(source_entity_id, target_entity_id),
+            ),
+        )
         return bool(record and record["deleted"])
+
+    async def _list_entity_embedding_candidates(
+        self,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str],
+    ) -> list[EmbeddingCandidate]:
+        candidates: list[EmbeddingCandidate] = []
+        offset = 0
+        page_size = max(limit * 4, 64)
+        await self.connect()
+        async with self._driver.session() as session:
+            while len(candidates) < limit:
+                result = await session.run(
+                    _ENTITY_EMBEDDING_CANDIDATES_CYPHER,
+                    limit=page_size,
+                    skip=offset,
+                    exclude_keys=exclude_source_keys,
+                )
+                records = [record.data() async for record in result]
+                if not records:
+                    break
+                for record in records:
+                    input_text = build_entity_embedding_text(
+                        name=str(record.get("name") or ""),
+                        category=str(record.get("category") or "unknown"),
+                        summary=str(record.get("summary") or ""),
+                        aliases=record.get("aliases", []),
+                        outgoing_relations=record.get("outgoing_relations", []),
+                        incoming_relations=record.get("incoming_relations", []),
+                        mentioned_in_pages=record.get("mentioned_in_pages", []),
+                        text_max_chars=self._settings.embedding_text_max_chars,
+                    )
+                    target_hash = compute_embedding_content_hash(
+                        version=self._settings.embedding_version,
+                        text=input_text,
+                    )
+                    if (
+                        not reindex
+                        and not _embedding_record_is_stale(
+                            record=record,
+                            target_hash=target_hash,
+                            embedding_version=self._settings.embedding_version,
+                            embedding_model=self._settings.openai_embedding_model,
+                        )
+                    ):
+                        continue
+                    candidates.append(
+                        EmbeddingCandidate(
+                            source_type=EmbeddingSourceType.entity,
+                            source_key=str(record["entity_id"]),
+                            embedding_key=build_embedding_key(
+                                EmbeddingSourceType.entity,
+                                str(record["entity_id"]),
+                            ),
+                            input_text=input_text,
+                            target_hash=target_hash,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(records) < page_size:
+                    break
+                offset += page_size
+        return candidates
+
+    async def _list_page_embedding_candidates(
+        self,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str],
+    ) -> list[EmbeddingCandidate]:
+        candidates: list[EmbeddingCandidate] = []
+        offset = 0
+        page_size = max(limit * 4, 64)
+        await self.connect()
+        async with self._driver.session() as session:
+            while len(candidates) < limit:
+                result = await session.run(
+                    _PAGE_EMBEDDING_CANDIDATES_CYPHER,
+                    limit=page_size,
+                    skip=offset,
+                    exclude_keys=exclude_source_keys,
+                )
+                records = [record.data() async for record in result]
+                if not records:
+                    break
+                for record in records:
+                    input_text = build_page_embedding_text(record.get("summary"))
+                    target_hash = compute_embedding_content_hash(
+                        version=self._settings.embedding_version,
+                        text=input_text,
+                    )
+                    if (
+                        not reindex
+                        and not _embedding_record_is_stale(
+                            record=record,
+                            target_hash=target_hash,
+                            embedding_version=self._settings.embedding_version,
+                            embedding_model=self._settings.openai_embedding_model,
+                        )
+                    ):
+                        continue
+                    candidates.append(
+                        EmbeddingCandidate(
+                            source_type=EmbeddingSourceType.page,
+                            source_key=str(record["canonical_url"]),
+                            embedding_key=build_embedding_key(
+                                EmbeddingSourceType.page,
+                                str(record["canonical_url"]),
+                            ),
+                            input_text=input_text,
+                            target_hash=target_hash,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(records) < page_size:
+                    break
+                offset += page_size
+        return candidates
+
+    async def _list_relation_embedding_candidates(
+        self,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str],
+    ) -> list[EmbeddingCandidate]:
+        candidates: list[EmbeddingCandidate] = []
+        offset = 0
+        page_size = max(limit * 4, 64)
+        await self.connect()
+        async with self._driver.session() as session:
+            while len(candidates) < limit:
+                result = await session.run(
+                    _RELATION_EMBEDDING_CANDIDATES_CYPHER,
+                    limit=page_size,
+                    skip=offset,
+                    exclude_keys=exclude_source_keys,
+                )
+                records = [record.data() async for record in result]
+                if not records:
+                    break
+                for record in records:
+                    pair_key = build_relation_pair_key(
+                        str(record["left_entity_id"]),
+                        str(record["right_entity_id"]),
+                    )
+                    input_text = build_relation_embedding_text(
+                        left_entity_id=str(record["left_entity_id"]),
+                        left_entity_name=str(record.get("left_entity_name") or record["left_entity_id"]),
+                        right_entity_id=str(record["right_entity_id"]),
+                        right_entity_name=str(record.get("right_entity_name") or record["right_entity_id"]),
+                        relations=record.get("relations", []),
+                        text_max_chars=self._settings.embedding_text_max_chars,
+                    )
+                    target_hash = compute_embedding_content_hash(
+                        version=self._settings.embedding_version,
+                        text=input_text,
+                    )
+                    if (
+                        not reindex
+                        and not _embedding_record_is_stale(
+                            record=record,
+                            target_hash=target_hash,
+                            embedding_version=self._settings.embedding_version,
+                            embedding_model=self._settings.openai_embedding_model,
+                        )
+                    ):
+                        continue
+                    candidates.append(
+                        EmbeddingCandidate(
+                            source_type=EmbeddingSourceType.relation,
+                            source_key=pair_key,
+                            embedding_key=build_embedding_key(EmbeddingSourceType.relation, pair_key),
+                            input_text=input_text,
+                            target_hash=target_hash,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(records) < page_size:
+                    break
+                offset += page_size
+        return candidates
+
+    @staticmethod
+    async def _get_entity_embedding_source_tx(tx, entity_id: str) -> dict[str, Any] | None:
+        result = await tx.run(_ENTITY_EMBEDDING_SOURCE_CYPHER, entity_id=entity_id)
+        record = await result.single()
+        return record.data() if record else None
+
+    @staticmethod
+    async def _mark_entity_embedding_target_tx(
+        tx,
+        *,
+        entity_id: str,
+        target_hash: str,
+    ) -> None:
+        await tx.run(
+            """
+            MATCH (entity:Entity {entity_id: $entity_id})
+            OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})-[:EMBEDS]->(entity)
+            SET entity.embedding_target_hash = $target_hash,
+                entity.embedding_last_error = CASE
+                    WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $target_hash
+                    THEN entity.embedding_last_error
+                    ELSE null
+                END,
+                entity.embedding_last_dirty_at = CASE
+                    WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $target_hash
+                    THEN entity.embedding_last_dirty_at
+                    ELSE datetime()
+                END
+            """,
+            entity_id=entity_id,
+            target_hash=target_hash,
+            embedding_key=build_embedding_key(EmbeddingSourceType.entity, entity_id),
+        )
+
+    @staticmethod
+    async def _upsert_embeddings_tx(tx, records: list[dict[str, Any]]) -> None:
+        await tx.run(
+            """
+            UNWIND $records AS record
+            CALL {
+                WITH record
+                OPTIONAL MATCH (entity:Entity {entity_id: record.source_key})
+                WHERE record.source_type = 'entity'
+                RETURN entity AS node, null AS related_node, 'entity' AS resolved_type
+                UNION
+                WITH record
+                OPTIONAL MATCH (page:Page {canonical_url: record.source_key})
+                WHERE record.source_type = 'page'
+                RETURN page AS node, null AS related_node, 'page' AS resolved_type
+                UNION
+                WITH record
+                OPTIONAL MATCH (left:Entity {entity_id: record.left_entity_id})
+                OPTIONAL MATCH (right:Entity {entity_id: record.right_entity_id})
+                WHERE record.source_type = 'relation'
+                RETURN left AS node, right AS related_node, 'relation' AS resolved_type
+            }
+            WITH record, node, related_node, resolved_type
+            WHERE node IS NOT NULL
+            MERGE (embedding:Embedding {embedding_key: record.embedding_key})
+            SET embedding.source_type = record.source_type,
+                embedding.source_key = record.source_key,
+                embedding.embedding = record.embedding,
+                embedding.embedding_model = record.embedding_model,
+                embedding.embedding_dim = record.embedding_dim,
+                embedding.embedding_version = record.embedding_version,
+                embedding.content_hash = record.content_hash,
+                embedding.embedding_updated_at = datetime(record.updated_at),
+                embedding.last_error = null
+            FOREACH (_ IN CASE WHEN resolved_type IN ['entity', 'page'] THEN [1] ELSE [] END |
+                MERGE (embedding)-[:EMBEDS]->(node)
+                SET node.embedding_target_hash = record.content_hash,
+                    node.embedding_last_synced_at = datetime(record.updated_at),
+                    node.embedding_last_error = null
+            )
+            FOREACH (_ IN CASE WHEN resolved_type = 'relation' AND related_node IS NOT NULL THEN [1] ELSE [] END |
+                SET embedding.left_entity_id = record.left_entity_id,
+                    embedding.right_entity_id = record.right_entity_id,
+                    embedding.aggregated_text = record.aggregated_text,
+                    embedding:RelationEmbedding
+                MERGE (embedding)-[:EMBEDS {position: 'left'}]->(node)
+                MERGE (embedding)-[:EMBEDS {position: 'right'}]->(related_node)
+            )
+            """,
+            records=records,
+        )
+
+    @staticmethod
+    async def _mark_embedding_failed_tx(
+        tx,
+        *,
+        source_type: str,
+        source_key: str,
+        error: str,
+    ) -> None:
+        await tx.run(
+            """
+            OPTIONAL MATCH (node)
+            WHERE ($source_type = 'entity' AND node:Entity AND node.entity_id = $source_key)
+               OR ($source_type = 'page' AND node:Page AND node.canonical_url = $source_key)
+            OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})
+            FOREACH (_ IN CASE WHEN node IS NOT NULL THEN [1] ELSE [] END |
+                SET node.embedding_last_error = $error,
+                    node.embedding_last_dirty_at = coalesce(node.embedding_last_dirty_at, datetime())
+            )
+            FOREACH (_ IN CASE WHEN embedding IS NOT NULL THEN [1] ELSE [] END |
+                SET embedding.last_error = $error
+            )
+            """,
+            source_type=source_type,
+            source_key=source_key,
+            error=error,
+            embedding_key=build_embedding_key(EmbeddingSourceType(source_type), source_key),
+        )
 
 
 def _build_entity_payload(
@@ -1082,6 +1686,67 @@ def _to_json_string(value: Any) -> str | None:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _build_page_embedding_target_hash(*, summary: str, version: str) -> str:
+    return compute_embedding_content_hash(
+        version=version,
+        text=build_page_embedding_text(summary),
+    )
+
+
+def _merge_entity_context_matches(
+    keyword_matches: list[dict[str, Any]],
+    vector_matches: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+
+    for rank, match in enumerate(keyword_matches, start=1):
+        entity_id = str(match.get("entity_id") or "")
+        if not entity_id:
+            continue
+        current = merged.get(entity_id, {**match, "hybrid_score": 0.0})
+        current["hybrid_score"] = float(current.get("hybrid_score") or 0.0) + (3.0 / rank)
+        merged[entity_id] = {**current, **match}
+
+    for rank, match in enumerate(vector_matches, start=1):
+        entity_id = str(match.get("entity_id") or "")
+        if not entity_id:
+            continue
+        current = merged.get(entity_id, {**match, "hybrid_score": 0.0})
+        vector_score = float(match.get("vector_score") or 0.0)
+        current["hybrid_score"] = float(current.get("hybrid_score") or 0.0) + vector_score + (1.0 / rank)
+        current["vector_score"] = vector_score
+        merged[entity_id] = {**current, **match}
+
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            float(item.get("hybrid_score") or 0.0),
+            int(item.get("completeness_score") or 0),
+            int(item.get("relation_count") or 0),
+            len(str(item.get("summary") or "")),
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def _embedding_record_is_stale(
+    *,
+    record: dict[str, Any],
+    target_hash: str,
+    embedding_version: str,
+    embedding_model: str,
+) -> bool:
+    return (
+        not str(record.get("embedding_content_hash") or "").strip()
+        or str(record.get("embedding_content_hash") or "") != target_hash
+        or str(record.get("embedding_version") or "") != embedding_version
+        or str(record.get("embedding_model") or "") != embedding_model
+        or bool(str(record.get("embedding_last_error") or "").strip())
+    )
+
+
 _ENTITY_CONTEXT_CYPHER = """
 MATCH (e:Entity)
 WHERE toLower(e.name) CONTAINS toLower($search_text)
@@ -1114,6 +1779,168 @@ ORDER BY match_score DESC,
          (outgoing_relations + incoming_relations) DESC,
          size(coalesce(e.summary, "")) DESC,
          size(coalesce(e.aliases, [])) DESC
+LIMIT $limit
+"""
+
+_ENTITY_VECTOR_CONTEXT_CYPHER = """
+CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
+YIELD node, score
+WHERE node:Embedding AND node.source_type = $source_type
+MATCH (node)-[:EMBEDS]->(entity:Entity)
+OPTIONAL MATCH (entity)-[outgoing:RELATED_TO]->()
+WITH entity, score, count(DISTINCT outgoing) AS outgoing_relations
+OPTIONAL MATCH ()-[incoming:RELATED_TO]->(entity)
+WITH entity, score, outgoing_relations, count(DISTINCT incoming) AS incoming_relations
+OPTIONAL MATCH (entity)-[:MENTIONED_IN]->(page:Page)
+WITH entity, score, outgoing_relations, incoming_relations, count(DISTINCT page) AS mentioned_in_count
+RETURN entity.entity_id AS entity_id,
+       entity.name AS name,
+       entity.category AS category,
+       entity.summary AS summary,
+       coalesce(entity.aliases, []) AS aliases,
+       outgoing_relations,
+       incoming_relations,
+       mentioned_in_count,
+       score AS vector_score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+_PAGE_VECTOR_QUERY_CYPHER = """
+CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
+YIELD node, score
+WHERE node:Embedding AND node.source_type = $source_type
+MATCH (node)-[:EMBEDS]->(page:Page)
+RETURN page.canonical_url AS source_key,
+       page.title AS title,
+       page.summary AS summary,
+       score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+_RELATION_VECTOR_QUERY_CYPHER = """
+CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
+YIELD node, score
+WHERE node:RelationEmbedding AND node.source_type = $source_type
+RETURN node.source_key AS source_key,
+       node.left_entity_id AS left_entity_id,
+       node.right_entity_id AS right_entity_id,
+       node.aggregated_text AS aggregated_text,
+       node.score AS stored_score,
+       node.embedding_updated_at AS embedding_updated_at,
+       node.content_hash AS content_hash,
+       score,
+       coalesce([(node)-[:EMBEDS {position: 'left'}]->(left:Entity) | left.name][0], node.left_entity_id) AS left_entity_name,
+       coalesce([(node)-[:EMBEDS {position: 'right'}]->(right:Entity) | right.name][0], node.right_entity_id) AS right_entity_name
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+_ENTITY_EMBEDDING_SOURCE_CYPHER = """
+MATCH (entity:Entity {entity_id: $entity_id})
+RETURN entity.entity_id AS entity_id,
+       entity.name AS name,
+       entity.category AS category,
+       entity.summary AS summary,
+       coalesce(entity.aliases, []) AS aliases,
+       [(entity)-[rel:RELATED_TO]->(target:Entity) |
+           {
+               type: coalesce(rel.relation_type, "RELATED_TO"),
+               target: target.name,
+               evidence: rel.evidence
+           }
+       ] AS outgoing_relations,
+       [(source:Entity)-[rel:RELATED_TO]->(entity) |
+           {
+               type: coalesce(rel.relation_type, "RELATED_TO"),
+               source: source.name,
+               evidence: rel.evidence
+           }
+       ] AS incoming_relations,
+       [(entity)-[:MENTIONED_IN]->(page:Page) | page.canonical_url] AS mentioned_in_pages
+"""
+
+_ENTITY_EMBEDDING_CANDIDATES_CYPHER = """
+MATCH (entity:Entity)
+WHERE NOT entity.entity_id IN $exclude_keys
+OPTIONAL MATCH (embedding:Embedding)-[:EMBEDS]->(entity)
+WHERE embedding.embedding_key = 'entity:' + entity.entity_id
+WITH entity, embedding
+RETURN entity.entity_id AS entity_id,
+       entity.name AS name,
+       entity.category AS category,
+       entity.summary AS summary,
+       coalesce(entity.aliases, []) AS aliases,
+       entity.embedding_target_hash AS embedding_target_hash,
+       entity.embedding_last_error AS embedding_last_error,
+       embedding.content_hash AS embedding_content_hash,
+       embedding.embedding_version AS embedding_version,
+       embedding.embedding_model AS embedding_model,
+       [(entity)-[rel:RELATED_TO]->(target:Entity) |
+           {
+               type: coalesce(rel.relation_type, "RELATED_TO"),
+               target: target.name,
+               evidence: rel.evidence
+           }
+       ] AS outgoing_relations,
+       [(source:Entity)-[rel:RELATED_TO]->(entity) |
+           {
+               type: coalesce(rel.relation_type, "RELATED_TO"),
+               source: source.name,
+               evidence: rel.evidence
+           }
+       ] AS incoming_relations,
+       [(entity)-[:MENTIONED_IN]->(page:Page) | page.canonical_url] AS mentioned_in_pages
+ORDER BY entity.updated_at DESC, entity.name ASC
+SKIP $skip
+LIMIT $limit
+"""
+
+_PAGE_EMBEDDING_CANDIDATES_CYPHER = """
+MATCH (page:Page)
+WHERE NOT page.canonical_url IN $exclude_keys
+OPTIONAL MATCH (embedding:Embedding)-[:EMBEDS]->(page)
+WHERE embedding.embedding_key = 'page:' + page.canonical_url
+WITH page, embedding
+RETURN page.canonical_url AS canonical_url,
+       page.summary AS summary,
+       page.embedding_target_hash AS embedding_target_hash,
+       page.embedding_last_error AS embedding_last_error,
+       embedding.content_hash AS embedding_content_hash,
+       embedding.embedding_version AS embedding_version,
+       embedding.embedding_model AS embedding_model
+ORDER BY page.fetched_at DESC, page.canonical_url ASC
+SKIP $skip
+LIMIT $limit
+"""
+
+_RELATION_EMBEDDING_CANDIDATES_CYPHER = """
+MATCH (left:Entity)-[rel:RELATED_TO]-(right:Entity)
+WHERE left.entity_id < right.entity_id
+  AND NOT (left.entity_id + '::' + right.entity_id) IN $exclude_keys
+WITH left, right, collect(
+    {
+        source_entity_id: startNode(rel).entity_id,
+        source_name: startNode(rel).name,
+        target_entity_id: endNode(rel).entity_id,
+        target_name: endNode(rel).name,
+        type: coalesce(rel.relation_type, "RELATED_TO"),
+        evidence: rel.evidence
+    }
+) AS relations
+OPTIONAL MATCH (embedding:RelationEmbedding {embedding_key: 'relation:' + left.entity_id + '::' + right.entity_id})
+RETURN left.entity_id AS left_entity_id,
+       left.name AS left_entity_name,
+       right.entity_id AS right_entity_id,
+       right.name AS right_entity_name,
+       relations,
+       embedding.content_hash AS embedding_content_hash,
+       embedding.embedding_version AS embedding_version,
+       embedding.embedding_model AS embedding_model,
+       embedding.last_error AS embedding_last_error
+ORDER BY left.updated_at DESC, right.updated_at DESC, left.entity_id ASC, right.entity_id ASC
+SKIP $skip
 LIMIT $limit
 """
 

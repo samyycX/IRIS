@@ -2,6 +2,8 @@ import { Routes, Route, Link } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import Home from './pages/Home'
 import JobDetail from './pages/JobDetail'
+import VectorIndex from './pages/VectorIndex'
+import VectorIndexJobDetail from './pages/VectorIndexJobDetail'
 import { Activity } from 'lucide-react'
 
 function App() {
@@ -19,6 +21,8 @@ function App() {
           {t('IRIS Project')}
         </Link>
         <div className="flex gap-4">
+          <Link to="/" className="text-sm hover:underline">{t('Home')}</Link>
+          <Link to="/vector-index" className="text-sm hover:underline">{t('Vector Index')}</Link>
           <button onClick={toggleLanguage} className="text-sm hover:underline">
             {i18n.language === 'zh' ? 'English' : '中文'}
           </button>
@@ -28,6 +32,8 @@ function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/jobs/:jobId" element={<JobDetail />} />
+          <Route path="/vector-index" element={<VectorIndex />} />
+          <Route path="/vector-index/jobs/:jobId" element={<VectorIndexJobDetail />} />
         </Routes>
       </main>
     </div>

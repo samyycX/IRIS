@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { ArrowLeft, Play, CheckCircle2, XCircle, Clock } from 'lucide-react'
+import { ArrowLeft, Play, CheckCircle2, XCircle, Clock, RotateCcw, Pause, Ban } from 'lucide-react'
 import {
   Card,
   CardContent,
@@ -10,6 +10,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 
 interface JobEvent {
   created_at: string
@@ -25,8 +26,11 @@ interface JobData {
   seed: string
   visited_count: number
   failed_count: number
-  start_time: string
-  end_time?: string
+  created_at: string
+  updated_at: string
+  completed_at?: string
+  resume_available: boolean
+  completion_reason?: string
 }
 
 export default function JobDetail() {
@@ -34,28 +38,37 @@ export default function JobDetail() {
   const { t } = useTranslation()
   const [job, setJob] = useState<JobData | null>(null)
   const [events, setEvents] = useState<JobEvent[]>([])
+  const [streamVersion, setStreamVersion] = useState(0)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!jobId) return
 
-    // Fetch initial job info
-    fetch(`/api/jobs/${jobId}`)
-      .then(res => res.json())
-      .then(data => setJob(data))
-      .catch(console.error)
+    const loadJob = async () => {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}`)
+        const data = await res.json()
+        setJob(data)
+      } catch (err) {
+        console.error(err)
+      }
+    }
 
-    // Fetch existing events
-    fetch(`/api/jobs/${jobId}/events`)
-      .then(res => res.json())
-      .then(data => {
+    const loadEvents = async () => {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}/events`)
+        const data = await res.json()
         if (Array.isArray(data)) {
           setEvents(data)
         }
-      })
-      .catch(console.error)
+      } catch (err) {
+        console.error(err)
+      }
+    }
 
-    // Setup SSE
+    loadJob()
+    loadEvents()
+
     const evtSource = new EventSource(`/api/jobs/${jobId}/stream`)
     
     evtSource.onmessage = (e) => {
@@ -85,7 +98,7 @@ export default function JobDetail() {
     return () => {
       evtSource.close()
     }
-  }, [jobId])
+  }, [jobId, streamVersion])
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -95,10 +108,58 @@ export default function JobDetail() {
     return <div className="flex items-center justify-center h-64"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div></div>
   }
 
+  const handleResume = async () => {
+    if (!jobId) return
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/resume`, { method: 'POST' })
+      if (!res.ok) {
+        throw new Error(`Resume failed: ${res.status}`)
+      }
+      const data = await res.json()
+      setJob(data)
+      setStreamVersion(prev => prev + 1)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const handlePause = async () => {
+    if (!jobId) return
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/pause`, { method: 'POST' })
+      if (!res.ok) {
+        throw new Error(`Pause failed: ${res.status}`)
+      }
+      const data = await res.json()
+      setJob(data)
+      setStreamVersion(prev => prev + 1)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const handleCancel = async () => {
+    if (!jobId) return
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' })
+      if (!res.ok) {
+        throw new Error(`Cancel failed: ${res.status}`)
+      }
+      const data = await res.json()
+      setJob(data)
+      setStreamVersion(prev => prev + 1)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
   const getStatusIcon = (status: string) => {
     switch (status) {
       case 'completed': return <CheckCircle2 className="w-5 h-5 text-green-500" />
       case 'failed': return <XCircle className="w-5 h-5 text-red-500" />
+      case 'cancelled': return <Ban className="w-5 h-5 text-red-500" />
+      case 'paused': return <Pause className="w-5 h-5 text-amber-500" />
+      case 'interrupted': return <RotateCcw className="w-5 h-5 text-amber-500" />
       case 'running': return <Play className="w-5 h-5 text-blue-500" />
       default: return <Clock className="w-5 h-5 text-gray-500" />
     }
@@ -108,6 +169,9 @@ export default function JobDetail() {
     switch (status) {
       case 'completed': return 'bg-green-500/10 text-green-500 hover:bg-green-500/20 border-green-500/20'
       case 'failed': return 'bg-red-500/10 text-red-500 hover:bg-red-500/20 border-red-500/20'
+      case 'cancelled': return 'bg-red-500/10 text-red-500 hover:bg-red-500/20 border-red-500/20'
+      case 'paused': return 'bg-amber-500/10 text-amber-500 hover:bg-amber-500/20 border-amber-500/20'
+      case 'interrupted': return 'bg-amber-500/10 text-amber-500 hover:bg-amber-500/20 border-amber-500/20'
       case 'running': return 'bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20'
       default: return 'bg-gray-500/10 text-gray-500 hover:bg-gray-500/20 border-gray-500/20'
     }
@@ -123,6 +187,24 @@ export default function JobDetail() {
           </Badge>
         </Link>
         <h1 className="text-2xl font-bold">{t('Job Detail')}</h1>
+        {job.status === 'queued' || job.status === 'running' ? (
+          <Button variant="outline" size="sm" onClick={handlePause}>
+            <Pause className="w-4 h-4 mr-2" />
+            {t('Pause')}
+          </Button>
+        ) : null}
+        {job.status !== 'completed' && job.status !== 'cancelled' ? (
+          <Button variant="destructive" size="sm" onClick={handleCancel}>
+            <Ban className="w-4 h-4 mr-2" />
+            {t('Cancel')}
+          </Button>
+        ) : null}
+        {job.resume_available && (job.status === 'interrupted' || job.status === 'failed' || job.status === 'paused') ? (
+          <Button variant="outline" size="sm" onClick={handleResume}>
+            <RotateCcw className="w-4 h-4 mr-2" />
+            {t('Resume')}
+          </Button>
+        ) : null}
       </div>
 
       <div className="grid gap-6 md:grid-cols-4">
@@ -162,6 +244,12 @@ export default function JobDetail() {
                 <div className="text-2xl font-bold">{job.failed_count}</div>
               </div>
             </div>
+            {job.completion_reason ? (
+              <div>
+                <div className="text-sm font-medium text-muted-foreground">{t('Completion Reason')}</div>
+                <div className="text-sm">{job.completion_reason}</div>
+              </div>
+            ) : null}
           </CardContent>
         </Card>
 
@@ -178,7 +266,7 @@ export default function JobDetail() {
                     {evt.created_at ? new Date(evt.created_at).toISOString().replace('T', ' ').substring(0, 23) : ''}
                   </span>
                   <span className={`shrink-0 w-24 ${
-                    evt.stage === 'failed' ? 'text-red-400' :
+                    evt.stage === 'failed' || evt.stage === 'cancelled' ? 'text-red-400' :
                     evt.stage === 'queued' || evt.stage === 'completed' ? 'text-green-400' :
                     'text-blue-400'
                   }`}>

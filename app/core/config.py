@@ -23,7 +23,28 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
+    openai_embedding_base_url: str = Field(
+        default="https://api.openai.com/v1",
+        alias="OPENAI_EMBEDDING_BASE_URL",
+    )
+    openai_embedding_api_key: str = Field(default="", alias="OPENAI_EMBEDDING_API_KEY")
+    openai_embedding_model: str = Field(
+        default="text-embedding-3-small",
+        alias="OPENAI_EMBEDDING_MODEL",
+    )
     prompt_profile: str = Field(default="wuwa", alias="PROMPT_PROFILE")
+    embedding_dimensions: int = Field(default=1536, alias="EMBEDDING_DIMENSIONS", ge=1)
+    embedding_batch_size: int = Field(default=16, alias="EMBEDDING_BATCH_SIZE", ge=1)
+    embedding_text_max_chars: int = Field(default=4000, alias="EMBEDDING_TEXT_MAX_CHARS", ge=1)
+    embedding_version: str = Field(default="v1", alias="EMBEDDING_VERSION")
+    embedding_similarity_function: str = Field(
+        default="cosine",
+        alias="EMBEDDING_SIMILARITY_FUNCTION",
+    )
+    neo4j_embedding_index_name: str = Field(
+        default="embedding_index",
+        alias="NEO4J_EMBEDDING_INDEX_NAME",
+    )
 
     neo4j_uri: str = Field(default="neo4j://localhost:7687", alias="NEO4J_URI")
     neo4j_username: str = Field(default="neo4j", alias="NEO4J_USERNAME")
