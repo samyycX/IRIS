@@ -27,7 +27,6 @@
   "neo4j_profiles": [
     {
       "id": "local-neo4j",
-      "description": "optional",
       "uri": "neo4j://127.0.0.1:7687",
       "username": "neo4j",
       "password": "secret"
@@ -37,7 +36,6 @@
   "llm_profiles": [
     {
       "id": "gemini-main",
-      "description": "optional",
       "base_url": "https://example.com/v1",
       "api_key": "secret",
       "model": "gemini-3-pro"
@@ -47,7 +45,6 @@
   "embedding_profiles": [
     {
       "id": "embedding-main",
-      "description": "optional",
       "base_url": "https://example.com/v1",
       "api_key": "secret",
       "model": "text-embedding-3-small"

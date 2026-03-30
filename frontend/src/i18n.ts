@@ -179,9 +179,7 @@ const resources = {
       "prompts.entity_merge": "实体合并提示词",
       "prompts.entity_merge_desc": "用于合并重复实体的提示词。",
 
-      "config.profile.id": "配置 ID",
-      "config.profile.name": "名称",
-      "config.profile.description": "描述",
+      "config.profile.id": "ID",
       "config.profile.uri": "URI",
       "config.profile.username": "用户名",
       "config.profile.password": "密码",
@@ -369,9 +367,7 @@ const resources = {
       "prompts.entity_merge": "Entity Merge Prompt",
       "prompts.entity_merge_desc": "Prompt used to merge duplicate entities.",
 
-      "config.profile.id": "Profile ID",
-      "config.profile.name": "Name",
-      "config.profile.description": "Description",
+      "config.profile.id": "ID",
       "config.profile.uri": "URI",
       "config.profile.username": "Username",
       "config.profile.password": "Password",

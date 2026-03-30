@@ -1,5 +1,5 @@
 from app.core.config import BootstrapSettings, Settings
-from app.models import AppConfig, LLMProfile, RuntimeConfig
+from app.models import AppConfig, LLMProfile, Neo4jProfile, RuntimeConfig
 
 
 def test_profiles_only_require_id():
@@ -10,10 +10,25 @@ def test_profiles_only_require_id():
 
     assert config.llm_profiles[0].model_dump() == {
         "id": "llm-main",
-        "description": None,
         "base_url": "",
         "api_key": "",
         "model": "gpt-4.1",
+    }
+
+
+def test_neo4j_profile_has_only_id_and_connection_fields():
+    profile = Neo4jProfile(
+        id="local",
+        uri="neo4j://127.0.0.1:7687",
+        username="neo4j",
+        password="x",
+    )
+    dumped = profile.model_dump()
+    assert dumped == {
+        "id": "local",
+        "uri": "neo4j://127.0.0.1:7687",
+        "username": "neo4j",
+        "password": "x",
     }
 
 

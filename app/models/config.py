@@ -16,7 +16,6 @@ class DataSourceKind(str, Enum):
 
 class BaseProfile(BaseModel):
     id: str
-    description: str | None = None
 
 
 class Neo4jProfile(BaseProfile):

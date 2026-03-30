@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -50,7 +51,7 @@ if os.path.exists(frontend_dist):
             index_path = os.path.join(frontend_dist, "index.html")
             if os.path.exists(index_path):
                 return FileResponse(index_path)
-        return await request.app.default_exception_handler(request, exc)
+        return await http_exception_handler(request, exc)
 
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):

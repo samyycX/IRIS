@@ -10,8 +10,12 @@ import { Badge } from "@/components/ui/badge"
 
 interface Profile {
   id: string;
-  description?: string;
-  [key: string]: any; // other fields based on kind
+  uri?: string;
+  username?: string;
+  password?: string;
+  base_url?: string;
+  api_key?: string;
+  model?: string;
 }
 
 interface Config {
@@ -119,18 +123,36 @@ export default function Configuration() {
   };
 
   const saveProfile = async (kind: string, profile: Profile, isNew: boolean) => {
+    let payload: Record<string, unknown>;
+    if (kind === 'neo4j') {
+      payload = {
+        id: profile.id,
+        uri: String(profile.uri ?? ''),
+        username: String(profile.username ?? ''),
+        password: String(profile.password ?? ''),
+      };
+    } else if (kind === 'llm' || kind === 'embedding') {
+      payload = {
+        id: profile.id,
+        base_url: String(profile.base_url ?? ''),
+        api_key: String(profile.api_key ?? ''),
+        model: String(profile.model ?? ''),
+      };
+    } else {
+      payload = { ...profile } as Record<string, unknown>;
+    }
     try {
       if (isNew) {
         await fetch(`/api/config/data-sources/${kind}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(profile)
+          body: JSON.stringify(payload)
         });
       } else {
         await fetch(`/api/config/data-sources/${kind}/${profile.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(profile)
+          body: JSON.stringify(payload)
         });
       }
       setEditingProfile(null);
@@ -179,7 +201,9 @@ export default function Configuration() {
           <Card className="bg-muted/50 border-primary">
             <CardContent className="pt-6 grid gap-4">
               <div className="grid gap-2">
-                <Label>{t('config.profile.id')} <span className="text-red-500">*</span></Label>
+                <Label>
+                  {t('config.profile.id')} <span className="text-red-500">*</span>
+                </Label>
                 <Input 
                   value={editingProfile.profile.id} 
                   onChange={e => setEditingProfile({ ...editingProfile, profile: { ...editingProfile.profile, id: e.target.value } })}
