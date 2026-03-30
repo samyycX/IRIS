@@ -13,20 +13,25 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models import (
     EmbeddingCandidate,
-    EmbeddingQueryResult,
     EmbeddingSourceType,
     ExtractedEntity,
     GraphUpdateResult,
+    IndexCandidateSample,
+    IndexQueryResult,
+    IndexScope,
+    IndexStatusEntry,
+    IndexType,
     JobRequest,
     JobSummary,
     PageExtraction,
+    TextIndexCandidate,
     utcnow,
 )
-from app.models.vector_index import VectorIndexScope
+from app.repos.langchain_graph import Neo4jGraphReadAdapter
 from app.services.llm.embedding_utils import (
     build_embedding_key,
     build_entity_embedding_text,
-    build_page_embedding_text,
+    build_source_embedding_text,
     build_relation_embedding_text,
     build_relation_pair_key,
     compute_embedding_content_hash,
@@ -34,9 +39,17 @@ from app.services.llm.embedding_utils import (
 )
 
 if TYPE_CHECKING:
-    from app.services.llm import EmbeddingClient
+    from app.services.llm.embedding_client import EmbeddingClient
 
 logger = get_logger(__name__)
+
+ENTITY_EMBEDDING_INDEX_NAME = "entity_embedding_index"
+SOURCE_EMBEDDING_INDEX_NAME = "source_embedding_index"
+RELATION_EMBEDDING_INDEX_NAME = "relation_embedding_index"
+ENTITY_FULLTEXT_INDEX_NAME = "entity_fulltext_index"
+SOURCE_FULLTEXT_INDEX_NAME = "source_fulltext_index"
+RELATION_FULLTEXT_INDEX_NAME = "relation_fulltext_index"
+DEFAULT_MENTIONED_IN_RELEVANCE = 0.5
 
 
 class Neo4jGraphRepository:
@@ -44,6 +57,7 @@ class Neo4jGraphRepository:
         self._settings = settings
         self._embedding_client = embedding_client
         self._driver = None
+        self._read_adapter = Neo4jGraphReadAdapter(settings)
         self.enabled = bool(
             settings.neo4j_uri and settings.neo4j_username and settings.neo4j_password
         )
@@ -60,6 +74,7 @@ class Neo4jGraphRepository:
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
+        await self._read_adapter.close()
 
     async def ensure_constraints(self) -> None:
         if not self.enabled:
@@ -67,8 +82,8 @@ class Neo4jGraphRepository:
         await self.connect()
         statements = [
             (
-                "CREATE CONSTRAINT page_canonical_url IF NOT EXISTS "
-                "FOR (p:Page) REQUIRE p.canonical_url IS UNIQUE"
+                "CREATE CONSTRAINT source_canonical_url IF NOT EXISTS "
+                "FOR (s:Source) REQUIRE s.canonical_url IS UNIQUE"
             ),
             (
                 "CREATE CONSTRAINT crawl_job_id IF NOT EXISTS "
@@ -87,56 +102,63 @@ class Neo4jGraphRepository:
             for statement in statements:
                 await session.run(statement)
 
-    async def page_exists(self, canonical_url: str) -> bool:
+    async def source_exists(self, canonical_url: str) -> bool:
         if not self.enabled:
             return False
-        await self.connect()
-        async with self._driver.session() as session:
-            result = await session.run(
-                "MATCH (p:Page {canonical_url: $canonical_url}) RETURN count(p) > 0 AS exists",
-                canonical_url=canonical_url,
-            )
-            record = await result.single()
-            return bool(record and record["exists"])
+        records = await self._query_read_records(
+            "source_exists",
+            "MATCH (s:Source {canonical_url: $canonical_url}) RETURN count(s) > 0 AS exists",
+            canonical_url=canonical_url,
+        )
+        return bool(records and records[0].get("exists"))
 
-    async def page_fetched_since(self, canonical_url: str, cutoff: datetime) -> bool:
+    async def source_fetched_since(self, canonical_url: str, cutoff: datetime) -> bool:
         if not self.enabled:
             return False
-        await self.connect()
-        async with self._driver.session() as session:
-            result = await session.run(
-                """
-                MATCH (p:Page {canonical_url: $canonical_url})
-                RETURN p.fetched_at IS NOT NULL
-                   AND p.fetched_at >= datetime($cutoff) AS is_recent
-                """,
-                canonical_url=canonical_url,
-                cutoff=cutoff.isoformat(),
-            )
-            record = await result.single()
-            return bool(record and record["is_recent"])
+        records = await self._query_read_records(
+            "source_fetched_since",
+            """
+            MATCH (s:Source {canonical_url: $canonical_url})
+            RETURN s.fetched_at IS NOT NULL
+               AND s.fetched_at >= datetime($cutoff) AS is_recent
+            """,
+            canonical_url=canonical_url,
+            cutoff=cutoff.isoformat(),
+        )
+        return bool(records and records[0].get("is_recent"))
 
     async def query_entity_context(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         if not self.enabled or not query.strip():
             return []
+        fulltext_matches = await self.query_fulltext_entities(query, limit=limit)
+        keyword_matches = [
+            _enrich_entity_context_record(record)
+            for record in await self._query_read_records(
+                "query_entity_context",
+                _ENTITY_CONTEXT_CYPHER,
+                search_text=query,
+                limit=limit,
+            )
+        ]
+        keyword_matches = _merge_entity_context_matches(
+            keyword_matches,
+            [result.model_dump(mode="json") for result in fulltext_matches],
+            limit=limit,
+            vector_field="fulltext_score",
+        )
+
+        if not self._embedding_client or not self._embedding_client.enabled:
+            return keyword_matches
+
         await self.connect()
         async with self._driver.session() as session:
-            keyword_result = await session.run(_ENTITY_CONTEXT_CYPHER, search_text=query, limit=limit)
-            keyword_matches = [
-                _enrich_entity_context_record(record.data()) async for record in keyword_result
-            ]
-
-            if not self._embedding_client or not self._embedding_client.enabled:
-                return keyword_matches
-
             try:
                 query_embedding = await self._embedding_client.embed_text(query.strip())
                 vector_result = await session.run(
                     _ENTITY_VECTOR_CONTEXT_CYPHER,
-                    index_name=self._settings.neo4j_embedding_index_name,
+                    index_name=ENTITY_EMBEDDING_INDEX_NAME,
                     query_embedding=query_embedding,
                     limit=limit,
-                    source_type=EmbeddingSourceType.entity.value,
                 )
                 vector_matches = [
                     _enrich_entity_context_record(record.data()) async for record in vector_result
@@ -145,7 +167,7 @@ class Neo4jGraphRepository:
                 logger.warning("entity_vector_query_failed", query=query, error=str(exc))
                 return keyword_matches
 
-            return _merge_entity_context_matches(keyword_matches, vector_matches, limit=limit)
+        return _merge_entity_context_matches(keyword_matches, vector_matches, limit=limit)
 
     async def query_related_url_entity_context(
         self,
@@ -155,102 +177,309 @@ class Neo4jGraphRepository:
     ) -> list[dict[str, Any]]:
         if not self.enabled or not candidate_urls:
             return []
-        await self.connect()
         contexts: list[dict[str, Any]] = []
-        async with self._driver.session() as session:
-            for candidate_url in candidate_urls:
-                lookup_terms = _build_related_url_lookup_terms(candidate_url)
-                if not lookup_terms:
-                    continue
-                matches_by_id: dict[str, dict[str, Any]] = {}
-                for term in lookup_terms[:RELATED_URL_LOOKUP_TERM_LIMIT]:
-                    result = await session.run(_ENTITY_CONTEXT_CYPHER, search_text=term, limit=limit_per_url)
-                    async for record in result:
-                        match = _enrich_entity_context_record(record.data())
-                        candidate_match = {**match, "matched_term": term}
-                        match_id = str(match.get("entity_id") or f"{match.get('name', '')}:{term}")
-                        current = matches_by_id.get(match_id)
-                        if current is None or _related_url_match_sort_key(
-                            candidate_match
-                        ) > _related_url_match_sort_key(current):
-                            matches_by_id[match_id] = candidate_match
-                if not matches_by_id:
-                    continue
-                matches = sorted(
-                    matches_by_id.values(),
-                    key=_related_url_match_sort_key,
-                    reverse=True,
-                )[:limit_per_url]
-                contexts.append(
-                    {
-                        "url": candidate_url,
-                        "lookup_terms": lookup_terms,
-                        "matches": matches,
-                        "best_match": matches[0],
-                    }
+        for candidate_url in candidate_urls:
+            lookup_terms = _build_related_url_lookup_terms(candidate_url)
+            if not lookup_terms:
+                continue
+            matches_by_id: dict[str, dict[str, Any]] = {}
+            for term in lookup_terms[:RELATED_URL_LOOKUP_TERM_LIMIT]:
+                records = await self._query_read_records(
+                    "query_related_url_entity_context",
+                    _ENTITY_CONTEXT_CYPHER,
+                    search_text=term,
+                    limit=limit_per_url,
                 )
+                for record in records:
+                    match = _enrich_entity_context_record(record)
+                    candidate_match = {**match, "matched_term": term}
+                    match_id = str(match.get("entity_id") or f"{match.get('name', '')}:{term}")
+                    current = matches_by_id.get(match_id)
+                    if current is None or _related_url_match_sort_key(
+                        candidate_match
+                    ) > _related_url_match_sort_key(current):
+                        matches_by_id[match_id] = candidate_match
+            if not matches_by_id:
+                continue
+            matches = sorted(
+                matches_by_id.values(),
+                key=_related_url_match_sort_key,
+                reverse=True,
+            )[:limit_per_url]
+            contexts.append(
+                {
+                    "url": candidate_url,
+                    "lookup_terms": lookup_terms,
+                    "matches": matches,
+                    "best_match": matches[0],
+                }
+            )
         return contexts
 
-    async def query_similar_pages(self, query: str, limit: int = 5) -> list[EmbeddingQueryResult]:
-        if (
-            not self.enabled
-            or not query.strip()
-            or not self._embedding_client
-            or not self._embedding_client.enabled
-        ):
+    async def query_entity_neighborhoods(
+        self,
+        entity_ids: list[str],
+        *,
+        hops: int = 2,
+        limit_per_entity: int = 6,
+    ) -> list[dict[str, Any]]:
+        if not self.enabled or not entity_ids:
             return []
-        await self.connect()
-        query_embedding = await self._embedding_client.embed_text(query.strip())
-        async with self._driver.session() as session:
-            result = await session.run(
-                _PAGE_VECTOR_QUERY_CYPHER,
-                index_name=self._settings.neo4j_embedding_index_name,
-                query_embedding=query_embedding,
-                limit=limit,
-                source_type=EmbeddingSourceType.page.value,
-            )
-            return [
-                EmbeddingQueryResult(
-                    source_type=EmbeddingSourceType.page,
-                    source_key=str(record["source_key"]),
-                    score=float(record["score"]),
-                    title=record.get("title"),
-                    summary=record.get("summary"),
-                )
-                async for record in result
-            ]
+        return await self._query_read_records(
+            "query_entity_neighborhoods",
+            _ENTITY_NEIGHBORHOOD_CYPHER,
+            entity_ids=entity_ids,
+            hops=max(1, min(hops, 2)),
+            limit_per_entity=limit_per_entity,
+        )
 
-    async def query_similar_relations(self, query: str, limit: int = 5) -> list[EmbeddingQueryResult]:
-        if (
-            not self.enabled
-            or not query.strip()
-            or not self._embedding_client
-            or not self._embedding_client.enabled
-        ):
+    async def query_graphrag_context(
+        self,
+        *,
+        query: str,
+        entity_limit: int,
+        source_limit: int,
+        relation_limit: int,
+        neighborhood_limit: int,
+        neighborhood_hops: int = 2,
+        candidate_urls: list[str] | None = None,
+    ) -> dict[str, Any]:
+        entities = await self.query_entity_context(query, limit=entity_limit)
+        sources = await self.query_source_context(query, limit=source_limit)
+        relations = await self.query_relation_context(query, limit=relation_limit)
+        candidate_url_entity_context = await self.query_related_url_entity_context(
+            candidate_urls or [],
+            limit_per_url=2,
+        )
+
+        seed_entity_ids: list[str] = []
+        for entity in entities:
+            entity_id = str(entity.get("entity_id") or "").strip()
+            if entity_id and entity_id not in seed_entity_ids:
+                seed_entity_ids.append(entity_id)
+        for relation in relations:
+            for entity_id in (relation.left_entity_id, relation.right_entity_id):
+                candidate_id = str(entity_id or "").strip()
+                if candidate_id and candidate_id not in seed_entity_ids:
+                    seed_entity_ids.append(candidate_id)
+        neighborhoods = await self.query_entity_neighborhoods(
+            seed_entity_ids[:entity_limit],
+            hops=neighborhood_hops,
+            limit_per_entity=neighborhood_limit,
+        )
+        return {
+            "query": query,
+            "entities": entities,
+            "sources": [result.model_dump(mode="json") for result in sources],
+            "relations": [result.model_dump(mode="json") for result in relations],
+            "neighborhoods": neighborhoods,
+            "candidate_url_entity_context": candidate_url_entity_context,
+        }
+
+    async def query_source_context(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+        if not self.enabled or not query.strip():
+            return []
+        vector_results: list[IndexQueryResult] = []
+        if self._embedding_client and self._embedding_client.enabled:
+            try:
+                await self.connect()
+                query_embedding = await self._embedding_client.embed_text(query.strip())
+                async with self._driver.session() as session:
+                    result = await session.run(
+                        _SOURCE_VECTOR_QUERY_CYPHER,
+                        index_name=SOURCE_EMBEDDING_INDEX_NAME,
+                        query_embedding=query_embedding,
+                        limit=limit,
+                    )
+                    vector_results = [
+                        IndexQueryResult(
+                            source_type=EmbeddingSourceType.source,
+                            source_key=str(record["source_key"]),
+                            score=float(record["score"]),
+                            vector_score=float(record["score"]),
+                            hybrid_score=float(record["score"]),
+                            title=record.get("title"),
+                            summary=record.get("summary"),
+                        )
+                        async for record in result
+                    ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("source_vector_query_failed", query=query, error=str(exc))
+        fulltext_results = await self.query_fulltext_sources(query, limit=limit)
+        return _merge_index_query_results(fulltext_results, vector_results, limit=limit)
+
+    async def query_relation_context(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+        if not self.enabled or not query.strip():
+            return []
+        vector_results: list[IndexQueryResult] = []
+        if self._embedding_client and self._embedding_client.enabled:
+            try:
+                await self.connect()
+                query_embedding = await self._embedding_client.embed_text(query.strip())
+                async with self._driver.session() as session:
+                    result = await session.run(
+                        _RELATION_VECTOR_QUERY_CYPHER,
+                        index_name=RELATION_EMBEDDING_INDEX_NAME,
+                        query_embedding=query_embedding,
+                        limit=limit,
+                    )
+                    vector_results = [
+                        IndexQueryResult(
+                            source_type=EmbeddingSourceType.relation,
+                            source_key=str(record["source_key"]),
+                            score=float(record["score"]),
+                            vector_score=float(record["score"]),
+                            hybrid_score=float(record["score"]),
+                            left_entity_id=record.get("left_entity_id"),
+                            right_entity_id=record.get("right_entity_id"),
+                            left_entity_name=record.get("left_entity_name"),
+                            right_entity_name=record.get("right_entity_name"),
+                            aggregated_text=record.get("aggregated_text"),
+                        )
+                        async for record in result
+                    ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("relation_vector_query_failed", query=query, error=str(exc))
+        fulltext_results = await self.query_fulltext_relations(query, limit=limit)
+        return _merge_index_query_results(fulltext_results, vector_results, limit=limit)
+
+    async def query_fulltext_entities(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+        if not self.enabled or not query.strip():
+            return []
+        try:
+            records = await self._query_read_records(
+                "query_fulltext_entities",
+                _ENTITY_FULLTEXT_QUERY_CYPHER,
+                index_name=ENTITY_FULLTEXT_INDEX_NAME,
+                query=query.strip(),
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("entity_fulltext_query_failed", query=query, error=str(exc))
+            return []
+        return [
+            IndexQueryResult(
+                source_type=EmbeddingSourceType.entity,
+                source_key=str(record["entity_id"]),
+                entity_id=str(record["entity_id"]),
+                score=float(record["score"]),
+                fulltext_score=float(record["score"]),
+                hybrid_score=float(record["score"]),
+                name=record.get("name"),
+                summary=record.get("summary"),
+                category=record.get("category"),
+                aliases=record.get("aliases", []),
+            )
+            for record in records
+        ]
+
+    async def query_fulltext_sources(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+        if not self.enabled or not query.strip():
+            return []
+        try:
+            records = await self._query_read_records(
+                "query_fulltext_sources",
+                _SOURCE_FULLTEXT_QUERY_CYPHER,
+                index_name=SOURCE_FULLTEXT_INDEX_NAME,
+                query=query.strip(),
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("source_fulltext_query_failed", query=query, error=str(exc))
+            return []
+        return [
+            IndexQueryResult(
+                source_type=EmbeddingSourceType.source,
+                source_key=str(record["source_key"]),
+                score=float(record["score"]),
+                fulltext_score=float(record["score"]),
+                hybrid_score=float(record["score"]),
+                title=record.get("title"),
+                summary=record.get("summary"),
+            )
+            for record in records
+        ]
+
+    async def query_fulltext_relations(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+        if not self.enabled or not query.strip():
+            return []
+        try:
+            records = await self._query_read_records(
+                "query_fulltext_relations",
+                _RELATION_FULLTEXT_QUERY_CYPHER,
+                index_name=RELATION_FULLTEXT_INDEX_NAME,
+                query=query.strip(),
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("relation_fulltext_query_failed", query=query, error=str(exc))
+            return []
+        return [
+            IndexQueryResult(
+                source_type=EmbeddingSourceType.relation,
+                source_key=str(record["source_key"]),
+                score=float(record["score"]),
+                fulltext_score=float(record["score"]),
+                hybrid_score=float(record["score"]),
+                left_entity_id=record.get("left_entity_id"),
+                right_entity_id=record.get("right_entity_id"),
+                left_entity_name=record.get("left_entity_name"),
+                right_entity_name=record.get("right_entity_name"),
+                aggregated_text=record.get("aggregated_text"),
+            )
+            for record in records
+        ]
+
+    async def get_index_statuses(self) -> list[IndexStatusEntry]:
+        if not self.enabled:
             return []
         await self.connect()
-        query_embedding = await self._embedding_client.embed_text(query.strip())
+        managed = {
+            (IndexType.vector.value, IndexScope.entity.value): ENTITY_EMBEDDING_INDEX_NAME,
+            (IndexType.vector.value, IndexScope.source.value): SOURCE_EMBEDDING_INDEX_NAME,
+            (IndexType.vector.value, IndexScope.relation.value): RELATION_EMBEDDING_INDEX_NAME,
+            (IndexType.fulltext.value, IndexScope.entity.value): ENTITY_FULLTEXT_INDEX_NAME,
+            (IndexType.fulltext.value, IndexScope.source.value): SOURCE_FULLTEXT_INDEX_NAME,
+            (IndexType.fulltext.value, IndexScope.relation.value): RELATION_FULLTEXT_INDEX_NAME,
+        }
         async with self._driver.session() as session:
-            result = await session.run(
-                _RELATION_VECTOR_QUERY_CYPHER,
-                index_name=self._settings.neo4j_embedding_index_name,
-                query_embedding=query_embedding,
-                limit=limit,
-                source_type=EmbeddingSourceType.relation.value,
-            )
-            return [
-                EmbeddingQueryResult(
-                    source_type=EmbeddingSourceType.relation,
-                    source_key=str(record["source_key"]),
-                    score=float(record["score"]),
-                    left_entity_id=record.get("left_entity_id"),
-                    right_entity_id=record.get("right_entity_id"),
-                    left_entity_name=record.get("left_entity_name"),
-                    right_entity_name=record.get("right_entity_name"),
-                    aggregated_text=record.get("aggregated_text"),
+            result = await session.run(_SHOW_INDEXES_CYPHER, index_names=list(managed.values()))
+            rows = [record.data() async for record in result]
+        by_name = {str(row["name"]): row for row in rows}
+        statuses: list[IndexStatusEntry] = []
+        for (index_type, scope), name in managed.items():
+            row = by_name.get(name)
+            statuses.append(
+                IndexStatusEntry(
+                    index_type=IndexType(index_type),
+                    scope=IndexScope(scope),
+                    name=name,
+                    exists=row is not None,
+                    state=row.get("state") if row else None,
+                    population_percent=float(row["population_percent"]) if row and row.get("population_percent") is not None else None,
+                    failure_message=row.get("failure_message") if row else None,
                 )
-                async for record in result
-            ]
+            )
+        return statuses
+
+    async def ensure_fulltext_indexes(self) -> list[IndexStatusEntry]:
+        if not self.enabled:
+            return []
+        await self.connect()
+        async with self._driver.session() as session:
+            for statement in _FULLTEXT_INDEX_CREATE_STATEMENTS:
+                await session.run(statement)
+        return await self.get_index_statuses()
+
+    async def rebuild_fulltext_indexes(self, scope: IndexScope = IndexScope.all) -> list[IndexStatusEntry]:
+        if not self.enabled:
+            return []
+        await self.connect()
+        statements = _fulltext_rebuild_statements(scope)
+        async with self._driver.session() as session:
+            for statement in statements:
+                await session.run(statement)
+        return await self.get_index_statuses()
 
     async def query_entity_merge_candidates(
         self,
@@ -259,7 +488,6 @@ class Neo4jGraphRepository:
     ) -> list[dict[str, Any]]:
         if not self.enabled or not name.strip():
             return []
-        await self.connect()
         search_terms = _build_search_terms(name, aliases or [])
         cypher = """
         MATCH (e:Entity)
@@ -286,11 +514,13 @@ class Neo4jGraphRepository:
                        evidence: rel.evidence
                    }
                ] AS incoming_relations,
-               [(e)-[:MENTIONED_IN]->(page:Page) | page.canonical_url] AS mentioned_in_pages
+               [(e)-[:MENTIONED_IN]->(source:Source) | source.canonical_url] AS mentioned_in_sources
         """
-        async with self._driver.session() as session:
-            result = await session.run(cypher, search_terms=search_terms)
-            return [record.data() async for record in result]
+        return await self._query_read_records(
+            "query_entity_merge_candidates",
+            cypher,
+            search_terms=search_terms,
+        )
 
     async def sync_job(
         self,
@@ -312,31 +542,33 @@ class Neo4jGraphRepository:
                 error=str(exc),
             )
 
-    async def upsert_page_and_entities(
+    async def upsert_source_and_entities(
         self,
         job_id: str,
         extraction: PageExtraction,
     ) -> GraphUpdateResult:
         update = GraphUpdateResult()
+        entity_ids_to_refresh: set[str] = set()
         if not self.enabled:
-            update.created_pages.append(extraction.canonical_url)
+            update.created_sources.append(extraction.canonical_url)
             update.created_entities = [entity.name for entity in extraction.extracted_entities]
             return update
 
         await self.connect()
-        page_was_present = await self.page_exists(extraction.canonical_url)
+        source_was_present = await self.source_exists(extraction.canonical_url)
 
         try:
             async with self._driver.session() as session:
-                page_target_hash = _build_page_embedding_target_hash(
+                source_target_hash = _build_source_embedding_target_hash(
                     summary=extraction.summary,
                     version=self._settings.embedding_version,
                 )
+                retained_entity_ids: set[str] = set()
                 await session.execute_write(
-                    self._upsert_page_tx,
+                    self._upsert_source_tx,
                     job_id,
                     extraction,
-                    page_target_hash,
+                    source_target_hash,
                 )
                 for entity in extraction.extracted_entities:
                     entity_update = await session.execute_write(
@@ -350,13 +582,21 @@ class Neo4jGraphRepository:
                         update.updated_entities.append(entity.name)
                     update.created_relationships += entity_update["created_relationships"]
                     update.deleted_relationships += entity_update["deleted_relationships"]
-                    await self.refresh_entity_embedding_target(entity_update["entity_id"])
+                    retained_entity_ids.update(entity_update["mentioned_entity_ids"])
+                    entity_ids_to_refresh.update(entity_update["mentioned_entity_ids"])
+                stale_mentioned_in = await session.execute_write(
+                    self._delete_stale_mentioned_in_tx,
+                    canonical_url=extraction.canonical_url,
+                    retained_entity_ids=sorted(retained_entity_ids),
+                )
+                update.deleted_relationships += stale_mentioned_in["deleted_relationships"]
+                entity_ids_to_refresh.update(stale_mentioned_in["entity_ids"])
                 await session.execute_write(
                     self._update_visited_relation_tx,
                     job_id=job_id,
                     extraction=extraction,
-                    page_created=not page_was_present,
-                    page_update=update.model_dump(mode="json"),
+                    source_created=not source_was_present,
+                    source_update=update.model_dump(mode="json"),
                 )
         except Neo4jError as exc:
             logger.exception(
@@ -367,8 +607,11 @@ class Neo4jGraphRepository:
             )
             raise
 
-        if not page_was_present:
-            update.created_pages.append(extraction.canonical_url)
+        for entity_id in sorted(entity_ids_to_refresh):
+            await self.refresh_entity_embedding_target(entity_id)
+
+        if not source_was_present:
+            update.created_sources.append(extraction.canonical_url)
         return update
 
     async def refresh_entity_embedding_target(self, entity_id: str) -> str | None:
@@ -386,7 +629,7 @@ class Neo4jGraphRepository:
                 aliases=payload.get("aliases", []),
                 outgoing_relations=payload.get("outgoing_relations", []),
                 incoming_relations=payload.get("incoming_relations", []),
-                mentioned_in_pages=payload.get("mentioned_in_pages", []),
+                mentioned_in_sources=payload.get("mentioned_in_sources", []),
                 text_max_chars=self._settings.embedding_text_max_chars,
             )
             target_hash = compute_embedding_content_hash(
@@ -402,7 +645,7 @@ class Neo4jGraphRepository:
 
     async def list_embedding_candidates(
         self,
-        scope: VectorIndexScope,
+        scope: IndexScope,
         *,
         limit: int,
         reindex: bool,
@@ -412,7 +655,7 @@ class Neo4jGraphRepository:
             return []
         exclude_source_keys = exclude_source_keys or []
         candidates: list[EmbeddingCandidate] = []
-        if scope in {VectorIndexScope.entity, VectorIndexScope.all}:
+        if scope in {IndexScope.entity, IndexScope.all}:
             candidates.extend(
                 await self._list_entity_embedding_candidates(
                     limit=limit,
@@ -420,15 +663,15 @@ class Neo4jGraphRepository:
                     exclude_source_keys=exclude_source_keys,
                 )
             )
-        if scope in {VectorIndexScope.page, VectorIndexScope.all} and len(candidates) < limit:
+        if scope in {IndexScope.source, IndexScope.all} and len(candidates) < limit:
             candidates.extend(
-                await self._list_page_embedding_candidates(
+                await self._list_source_embedding_candidates(
                     limit=limit - len(candidates),
                     reindex=reindex,
                     exclude_source_keys=exclude_source_keys,
                 )
             )
-        if scope in {VectorIndexScope.relation, VectorIndexScope.all} and len(candidates) < limit:
+        if scope in {IndexScope.relation, IndexScope.all} and len(candidates) < limit:
             candidates.extend(
                 await self._list_relation_embedding_candidates(
                     limit=limit - len(candidates),
@@ -437,6 +680,170 @@ class Neo4jGraphRepository:
                 )
             )
         return candidates[:limit]
+
+    async def prepare_embedding_candidates(
+        self,
+        scope: IndexScope,
+        *,
+        reindex: bool,
+        sample_limit: int,
+    ) -> tuple[dict[str, int], list[IndexCandidateSample]]:
+        counts = {
+            IndexScope.entity.value: 0,
+            IndexScope.source.value: 0,
+            IndexScope.relation.value: 0,
+        }
+        samples: list[IndexCandidateSample] = []
+        page_size = max(sample_limit, 128)
+        if scope in {IndexScope.entity, IndexScope.all}:
+            entity_candidates = await self._collect_embedding_candidates(
+                self._list_entity_embedding_candidates,
+                reindex=reindex,
+                page_size=page_size,
+            )
+            counts[IndexScope.entity.value] = len(entity_candidates)
+            samples.extend(_embedding_candidates_to_samples(entity_candidates[:sample_limit]))
+        if scope in {IndexScope.source, IndexScope.all}:
+            source_candidates = await self._collect_embedding_candidates(
+                self._list_source_embedding_candidates,
+                reindex=reindex,
+                page_size=page_size,
+            )
+            counts[IndexScope.source.value] = len(source_candidates)
+            samples.extend(_embedding_candidates_to_samples(source_candidates[:sample_limit]))
+        if scope in {IndexScope.relation, IndexScope.all}:
+            relation_candidates = await self._collect_embedding_candidates(
+                self._list_relation_embedding_candidates,
+                reindex=reindex,
+                page_size=page_size,
+            )
+            counts[IndexScope.relation.value] = len(relation_candidates)
+            samples.extend(_embedding_candidates_to_samples(relation_candidates[:sample_limit]))
+        return counts, samples[:sample_limit]
+
+    async def list_fulltext_candidates(
+        self,
+        scope: IndexScope,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str] | None = None,
+    ) -> list[TextIndexCandidate]:
+        if not self.enabled:
+            return []
+        exclude_source_keys = exclude_source_keys or []
+        candidates: list[TextIndexCandidate] = []
+        if scope in {IndexScope.entity, IndexScope.all}:
+            candidates.extend(
+                await self._list_entity_fulltext_candidates(
+                    limit=limit,
+                    reindex=reindex,
+                    exclude_source_keys=exclude_source_keys,
+                )
+            )
+        if scope in {IndexScope.source, IndexScope.all} and len(candidates) < limit:
+            candidates.extend(
+                await self._list_source_fulltext_candidates(
+                    limit=limit - len(candidates),
+                    reindex=reindex,
+                    exclude_source_keys=exclude_source_keys,
+                )
+            )
+        if scope in {IndexScope.relation, IndexScope.all} and len(candidates) < limit:
+            candidates.extend(
+                await self._list_relation_fulltext_candidates(
+                    limit=limit - len(candidates),
+                    reindex=reindex,
+                    exclude_source_keys=exclude_source_keys,
+                )
+            )
+        return candidates[:limit]
+
+    async def prepare_fulltext_candidates(
+        self,
+        scope: IndexScope,
+        *,
+        reindex: bool,
+        sample_limit: int,
+    ) -> tuple[dict[str, int], list[IndexCandidateSample]]:
+        counts = {
+            IndexScope.entity.value: 0,
+            IndexScope.source.value: 0,
+            IndexScope.relation.value: 0,
+        }
+        samples: list[IndexCandidateSample] = []
+        page_size = max(sample_limit, 128)
+        if scope in {IndexScope.entity, IndexScope.all}:
+            entity_candidates = await self._collect_text_candidates(
+                self._list_entity_fulltext_candidates,
+                reindex=reindex,
+                page_size=page_size,
+            )
+            counts[IndexScope.entity.value] = len(entity_candidates)
+            samples.extend(_text_candidates_to_samples(entity_candidates[:sample_limit]))
+        if scope in {IndexScope.source, IndexScope.all}:
+            source_candidates = await self._collect_text_candidates(
+                self._list_source_fulltext_candidates,
+                reindex=reindex,
+                page_size=page_size,
+            )
+            counts[IndexScope.source.value] = len(source_candidates)
+            samples.extend(_text_candidates_to_samples(source_candidates[:sample_limit]))
+        if scope in {IndexScope.relation, IndexScope.all}:
+            relation_candidates = await self._collect_text_candidates(
+                self._list_relation_fulltext_candidates,
+                reindex=reindex,
+                page_size=page_size,
+            )
+            counts[IndexScope.relation.value] = len(relation_candidates)
+            samples.extend(_text_candidates_to_samples(relation_candidates[:sample_limit]))
+        return counts, samples[:sample_limit]
+
+    async def _collect_embedding_candidates(
+        self,
+        loader,
+        *,
+        reindex: bool,
+        page_size: int,
+    ) -> list[EmbeddingCandidate]:
+        collected: list[EmbeddingCandidate] = []
+        seen: set[str] = set()
+        while True:
+            batch = await loader(
+                limit=page_size,
+                reindex=reindex,
+                exclude_source_keys=sorted(seen),
+            )
+            if not batch:
+                break
+            collected.extend(batch)
+            seen.update(candidate.source_key for candidate in batch)
+            if len(batch) < page_size:
+                break
+        return collected
+
+    async def _collect_text_candidates(
+        self,
+        loader,
+        *,
+        reindex: bool,
+        page_size: int,
+    ) -> list[TextIndexCandidate]:
+        collected: list[TextIndexCandidate] = []
+        seen: set[str] = set()
+        while True:
+            batch = await loader(
+                limit=page_size,
+                reindex=reindex,
+                exclude_source_keys=sorted(seen),
+            )
+            if not batch:
+                break
+            collected.extend(batch)
+            seen.update(candidate.source_key for candidate in batch)
+            if len(batch) < page_size:
+                break
+        return collected
 
     async def upsert_embeddings(
         self,
@@ -465,6 +872,8 @@ class Neo4jGraphRepository:
                     {
                         "left_entity_id": parse_relation_pair_key(record.source_key)[0],
                         "right_entity_id": parse_relation_pair_key(record.source_key)[1],
+                        "left_entity_name": parse_relation_pair_key(record.source_key)[0],
+                        "right_entity_name": parse_relation_pair_key(record.source_key)[1],
                         "aggregated_text": record.input_text,
                     }
                     if record.source_type == EmbeddingSourceType.relation
@@ -475,6 +884,33 @@ class Neo4jGraphRepository:
         ]
         async with self._driver.session() as session:
             await session.execute_write(self._upsert_embeddings_tx, payload)
+
+    async def upsert_fulltext_documents(self, records: list[TextIndexCandidate]) -> None:
+        if not self.enabled or not records:
+            return
+        await self.connect()
+        payload = [
+            {
+                "source_type": record.source_type.value,
+                "source_key": record.source_key,
+                "title": record.title,
+                "name": record.name,
+                "summary": record.summary,
+                "aggregated_text": record.aggregated_text,
+                "left_entity_name": record.left_entity_name,
+                "right_entity_name": record.right_entity_name,
+                "document_text": record.document_text,
+                "target_hash": record.target_hash,
+                "updated_at": utcnow().isoformat(),
+            }
+            for record in records
+        ]
+        async with self._driver.session() as session:
+            await session.execute_write(
+                self._upsert_fulltext_documents_tx,
+                payload,
+                self._settings.embedding_version,
+            )
 
     async def mark_embedding_failed(self, record: EmbeddingCandidate, error: str) -> None:
         if not self.enabled:
@@ -488,22 +924,35 @@ class Neo4jGraphRepository:
                 error=error,
             )
 
+    async def mark_fulltext_failed(self, record: TextIndexCandidate, error: str) -> None:
+        if not self.enabled:
+            return
+        await self.connect()
+        async with self._driver.session() as session:
+            await session.execute_write(
+                self._mark_fulltext_failed_tx,
+                source_type=record.source_type.value,
+                source_key=record.source_key,
+                error=error,
+            )
+
     async def query_preview(
         self,
         query: str,
         *,
         entity_limit: int,
-        page_limit: int,
+        source_limit: int,
         relation_limit: int,
     ) -> dict[str, list[dict[str, Any]]]:
-        return {
-            "entities": await self.query_entity_context(query, limit=entity_limit),
-            "pages": [result.model_dump(mode="json") for result in await self.query_similar_pages(query, limit=page_limit)],
-            "relations": [
-                result.model_dump(mode="json")
-                for result in await self.query_similar_relations(query, limit=relation_limit)
-            ],
-        }
+        return await self.query_graphrag_context(
+            query=query,
+            entity_limit=entity_limit,
+            source_limit=source_limit,
+            relation_limit=relation_limit,
+            neighborhood_limit=max(entity_limit, relation_limit),
+            neighborhood_hops=2,
+            candidate_urls=[],
+        )
 
     @staticmethod
     async def _upsert_job_tx(tx, payload: dict[str, Any]) -> None:
@@ -532,7 +981,7 @@ class Neo4jGraphRepository:
                 job.graph_update_json = coalesce($graph_update_json, job.graph_update_json),
                 job.created_entities = $created_entities,
                 job.updated_entities = $updated_entities,
-                job.created_pages = $created_pages,
+                job.created_sources = $created_sources,
                 job.created_relationships = $created_relationships,
                 job.deleted_relationships = $deleted_relationships
             """,
@@ -540,38 +989,36 @@ class Neo4jGraphRepository:
         )
 
     @staticmethod
-    async def _upsert_page_tx(
+    async def _upsert_source_tx(
         tx,
         job_id: str,
         extraction: PageExtraction,
-        page_target_hash: str,
+        source_target_hash: str,
     ) -> None:
         query = """
         MERGE (job:CrawlJob {job_id: $job_id})
         ON CREATE SET job.started_at = datetime(),
                       job.created_at = datetime()
-        MERGE (page:Page {canonical_url: $canonical_url})
-        WITH job, page
-        OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})-[:EMBEDS]->(page)
-        SET page.title = $title,
-            page.summary = $summary,
-            page.content_hash = $content_hash,
-            page.fetched_at = datetime(),
-            page.updated_at = datetime(),
-            page.created_at = coalesce(page.created_at, datetime()),
-            page.raw_text_excerpt = $raw_text_excerpt,
-            page.embedding_target_hash = $page_target_hash,
-            page.embedding_last_error = CASE
-                WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $page_target_hash
-                THEN page.embedding_last_error
+        MERGE (source:Source {canonical_url: $canonical_url})
+        SET source.title = $title,
+            source.summary = $summary,
+            source.content_hash = $content_hash,
+            source.fetched_at = datetime(),
+            source.updated_at = datetime(),
+            source.created_at = coalesce(source.created_at, datetime()),
+            source.raw_text_excerpt = $raw_text_excerpt,
+            source.embedding_target_hash = $source_target_hash,
+            source.embedding_last_error = CASE
+                WHEN coalesce(source.embedding_content_hash, '') = $source_target_hash
+                THEN source.embedding_last_error
                 ELSE null
             END,
-            page.embedding_last_dirty_at = CASE
-                WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $page_target_hash
-                THEN page.embedding_last_dirty_at
+            source.embedding_last_dirty_at = CASE
+                WHEN coalesce(source.embedding_content_hash, '') = $source_target_hash
+                THEN source.embedding_last_dirty_at
                 ELSE datetime()
             END
-        MERGE (job)-[:VISITED]->(page)
+        MERGE (job)-[:VISITED]->(source)
         """
         await tx.run(
             query,
@@ -581,16 +1028,15 @@ class Neo4jGraphRepository:
             summary=extraction.summary,
             content_hash=extraction.content_hash,
             raw_text_excerpt=extraction.raw_text_excerpt,
-            page_target_hash=page_target_hash,
-            embedding_key=build_embedding_key(EmbeddingSourceType.page, extraction.canonical_url),
+            source_target_hash=source_target_hash,
         )
 
         for discovered_url in extraction.discovered_urls:
             await tx.run(
                 """
-                MERGE (source:Page {canonical_url: $source_url})
-                MERGE (target:Page {canonical_url: $target_url})
-                MERGE (source)-[:LINKS_TO]->(target)
+                MERGE (origin:Source {canonical_url: $source_url})
+                MERGE (target:Source {canonical_url: $target_url})
+                MERGE (origin)-[:LINKS_TO]->(target)
                 """,
                 source_url=extraction.canonical_url,
                 target_url=discovered_url,
@@ -602,54 +1048,54 @@ class Neo4jGraphRepository:
         *,
         job_id: str,
         extraction: PageExtraction,
-        page_created: bool,
-        page_update: dict[str, Any],
+        source_created: bool,
+        source_update: dict[str, Any],
     ) -> None:
         await tx.run(
             """
             MATCH (job:CrawlJob {job_id: $job_id})
-            MATCH (page:Page {canonical_url: $canonical_url})
-            MERGE (job)-[visited:VISITED]->(page)
-            SET visited.page_created = $page_created,
-                visited.page_title = $page_title,
-                visited.page_summary = $page_summary,
+            MATCH (source:Source {canonical_url: $canonical_url})
+            MERGE (job)-[visited:VISITED]->(source)
+            SET visited.source_created = $source_created,
+                visited.source_title = $source_title,
+                visited.source_summary = $source_summary,
                 visited.content_hash = $content_hash,
                 visited.extracted_entity_count = $extracted_entity_count,
                 visited.discovered_url_count = $discovered_url_count,
                 visited.created_entities = $created_entities,
                 visited.updated_entities = $updated_entities,
-                visited.created_pages = $created_pages,
+                visited.created_sources = $created_sources,
                 visited.created_relationships = $created_relationships,
                 visited.deleted_relationships = $deleted_relationships,
                 visited.modification_summary = $modification_summary,
                 visited.change_log = $change_log,
-                visited.page_update_json = $page_update_json,
+                visited.source_update_json = $source_update_json,
                 visited.updated_at = datetime()
             """,
             job_id=job_id,
             canonical_url=extraction.canonical_url,
-            page_created=page_created,
-            page_title=extraction.title,
-            page_summary=extraction.summary,
+            source_created=source_created,
+            source_title=extraction.title,
+            source_summary=extraction.summary,
             content_hash=extraction.content_hash,
             extracted_entity_count=len(extraction.extracted_entities),
             discovered_url_count=len(extraction.discovered_urls),
-            created_entities=page_update.get("created_entities", []),
-            updated_entities=page_update.get("updated_entities", []),
-            created_pages=page_update.get("created_pages", []),
-            created_relationships=page_update.get("created_relationships", 0),
-            deleted_relationships=page_update.get("deleted_relationships", 0),
-            modification_summary=_build_page_modification_summary(
+            created_entities=source_update.get("created_entities", []),
+            updated_entities=source_update.get("updated_entities", []),
+            created_sources=source_update.get("created_sources", []),
+            created_relationships=source_update.get("created_relationships", 0),
+            deleted_relationships=source_update.get("deleted_relationships", 0),
+            modification_summary=_build_source_modification_summary(
                 extraction=extraction,
-                page_created=page_created,
-                page_update=page_update,
+                source_created=source_created,
+                source_update=source_update,
             ),
-            change_log=_build_page_change_log(
+            change_log=_build_source_change_log(
                 extraction=extraction,
-                page_created=page_created,
-                page_update=page_update,
+                source_created=source_created,
+                source_update=source_update,
             ),
-            page_update_json=_to_json_string(page_update),
+            source_update_json=_to_json_string(source_update),
         )
 
     @staticmethod
@@ -658,6 +1104,7 @@ class Neo4jGraphRepository:
         canonical_url: str,
         entity: ExtractedEntity,
     ) -> dict[str, Any]:
+        mentioned_entity_ids: set[str] = set()
         matches = await Neo4jGraphRepository._find_matching_entities_tx(
             tx,
             entity.name,
@@ -687,7 +1134,10 @@ class Neo4jGraphRepository:
             category=merged_payload["category"],
             summary=merged_payload["summary"],
             aliases=merged_payload["aliases"],
+            mentioned_in_score=entity.mentioned_in_score,
         )
+        if entity.mentioned_in_score is not None:
+            mentioned_entity_ids.add(canonical_entity_id)
 
         created_relationships = 0
         deleted_relationships = 0
@@ -748,6 +1198,7 @@ class Neo4jGraphRepository:
                 category=target_payload["category"],
                 summary=target_payload["summary"],
                 aliases=target_payload["aliases"],
+                mentioned_in_score=None,
             )
             relation_created = await Neo4jGraphRepository._upsert_relation_tx(
                 tx,
@@ -763,6 +1214,7 @@ class Neo4jGraphRepository:
             "entity_id": canonical_entity_id,
             "created_relationships": created_relationships,
             "deleted_relationships": deleted_relationships,
+            "mentioned_entity_ids": sorted(mentioned_entity_ids),
         }
 
     @staticmethod
@@ -820,10 +1272,11 @@ class Neo4jGraphRepository:
         category: str,
         summary: str,
         aliases: list[str],
+        mentioned_in_score: float | None,
     ) -> None:
         await tx.run(
             """
-            MATCH (page:Page {canonical_url: $canonical_url})
+            MATCH (source:Source {canonical_url: $canonical_url})
             MERGE (entity:Entity {entity_id: $entity_id})
             SET entity.name = $name,
                 entity.normalized_name = $normalized_name,
@@ -832,7 +1285,10 @@ class Neo4jGraphRepository:
                 entity.aliases = $aliases,
                 entity.updated_at = datetime(),
                 entity.created_at = coalesce(entity.created_at, datetime())
-            MERGE (entity)-[:MENTIONED_IN]->(page)
+            FOREACH (_ IN CASE WHEN $mentioned_in_score IS NULL THEN [] ELSE [1] END |
+                MERGE (entity)-[rel:MENTIONED_IN]->(source)
+                SET rel.relevance = $mentioned_in_score
+            )
             """,
             canonical_url=canonical_url,
             entity_id=entity_id,
@@ -841,7 +1297,36 @@ class Neo4jGraphRepository:
             category=category,
             summary=summary,
             aliases=aliases,
+            mentioned_in_score=mentioned_in_score,
         )
+
+    @staticmethod
+    async def _delete_stale_mentioned_in_tx(
+        tx,
+        *,
+        canonical_url: str,
+        retained_entity_ids: list[str],
+    ) -> dict[str, Any]:
+        result = await tx.run(
+            """
+            MATCH (source:Source {canonical_url: $canonical_url})
+            OPTIONAL MATCH (entity:Entity)-[rel:MENTIONED_IN]->(source)
+            WHERE NOT entity.entity_id IN $retained_entity_ids
+            WITH collect(DISTINCT entity.entity_id) AS entity_ids, collect(rel) AS rels
+            FOREACH (rel IN rels | DELETE rel)
+            RETURN [entity_id IN entity_ids WHERE entity_id IS NOT NULL] AS entity_ids,
+                   size(rels) AS deleted_relationships
+            """,
+            canonical_url=canonical_url,
+            retained_entity_ids=retained_entity_ids,
+        )
+        record = await result.single()
+        if record is None:
+            return {"entity_ids": [], "deleted_relationships": 0}
+        return {
+            "entity_ids": list(record["entity_ids"] or []),
+            "deleted_relationships": int(record["deleted_relationships"] or 0),
+        }
 
     @staticmethod
     async def _merge_entity_into_canonical_tx(
@@ -854,12 +1339,18 @@ class Neo4jGraphRepository:
             return
         await tx.run(
             """
-            MATCH (duplicate:Entity {entity_id: $duplicate_entity_id})-[:MENTIONED_IN]->(page:Page)
+            MATCH (duplicate:Entity {entity_id: $duplicate_entity_id})-[rel:MENTIONED_IN]->(source:Source)
             MATCH (canonical:Entity {entity_id: $canonical_entity_id})
-            MERGE (canonical)-[:MENTIONED_IN]->(page)
+            MERGE (canonical)-[merged:MENTIONED_IN]->(source)
+            SET merged.relevance = CASE
+                WHEN merged.relevance IS NULL THEN coalesce(rel.relevance, $default_relevance)
+                WHEN merged.relevance >= coalesce(rel.relevance, $default_relevance) THEN merged.relevance
+                ELSE coalesce(rel.relevance, $default_relevance)
+            END
             """,
             canonical_entity_id=canonical_entity_id,
             duplicate_entity_id=duplicate_entity_id,
+            default_relevance=DEFAULT_MENTIONED_IN_RELEVANCE,
         )
         await tx.run(
             """
@@ -1009,7 +1500,7 @@ class Neo4jGraphRepository:
                         aliases=record.get("aliases", []),
                         outgoing_relations=record.get("outgoing_relations", []),
                         incoming_relations=record.get("incoming_relations", []),
-                        mentioned_in_pages=record.get("mentioned_in_pages", []),
+                        mentioned_in_sources=record.get("mentioned_in_sources", []),
                         text_max_chars=self._settings.embedding_text_max_chars,
                     )
                     target_hash = compute_embedding_content_hash(
@@ -1045,7 +1536,7 @@ class Neo4jGraphRepository:
                 offset += page_size
         return candidates
 
-    async def _list_page_embedding_candidates(
+    async def _list_source_embedding_candidates(
         self,
         *,
         limit: int,
@@ -1059,7 +1550,7 @@ class Neo4jGraphRepository:
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
-                    _PAGE_EMBEDDING_CANDIDATES_CYPHER,
+                    _SOURCE_EMBEDDING_CANDIDATES_CYPHER,
                     limit=page_size,
                     skip=offset,
                     exclude_keys=exclude_source_keys,
@@ -1068,7 +1559,7 @@ class Neo4jGraphRepository:
                 if not records:
                     break
                 for record in records:
-                    input_text = build_page_embedding_text(record.get("summary"))
+                    input_text = build_source_embedding_text(record.get("summary"))
                     target_hash = compute_embedding_content_hash(
                         version=self._settings.embedding_version,
                         text=input_text,
@@ -1085,10 +1576,10 @@ class Neo4jGraphRepository:
                         continue
                     candidates.append(
                         EmbeddingCandidate(
-                            source_type=EmbeddingSourceType.page,
+                            source_type=EmbeddingSourceType.source,
                             source_key=str(record["canonical_url"]),
                             embedding_key=build_embedding_key(
-                                EmbeddingSourceType.page,
+                                EmbeddingSourceType.source,
                                 str(record["canonical_url"]),
                             ),
                             input_text=input_text,
@@ -1167,6 +1658,176 @@ class Neo4jGraphRepository:
                 offset += page_size
         return candidates
 
+    async def _list_entity_fulltext_candidates(
+        self,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str],
+    ) -> list[TextIndexCandidate]:
+        candidates: list[TextIndexCandidate] = []
+        offset = 0
+        page_size = max(limit * 4, 64)
+        await self.connect()
+        async with self._driver.session() as session:
+            while len(candidates) < limit:
+                result = await session.run(
+                    _ENTITY_FULLTEXT_CANDIDATES_CYPHER,
+                    limit=page_size,
+                    skip=offset,
+                    exclude_keys=exclude_source_keys,
+                )
+                records = [record.data() async for record in result]
+                if not records:
+                    break
+                for record in records:
+                    document_text = _build_entity_fulltext_text(
+                        name=str(record.get("name") or ""),
+                        aliases=record.get("aliases", []),
+                        summary=str(record.get("summary") or ""),
+                    )
+                    target_hash = _compute_fulltext_content_hash(
+                        version=self._settings.embedding_version,
+                        text=document_text,
+                    )
+                    if not reindex and not _fulltext_record_is_stale(
+                        record=record,
+                        target_hash=target_hash,
+                        version=self._settings.embedding_version,
+                    ):
+                        continue
+                    candidates.append(
+                        TextIndexCandidate(
+                            source_type=EmbeddingSourceType.entity,
+                            source_key=str(record["entity_id"]),
+                            name=record.get("name"),
+                            summary=record.get("summary"),
+                            document_text=document_text,
+                            target_hash=target_hash,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(records) < page_size:
+                    break
+                offset += page_size
+        return candidates
+
+    async def _list_source_fulltext_candidates(
+        self,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str],
+    ) -> list[TextIndexCandidate]:
+        candidates: list[TextIndexCandidate] = []
+        offset = 0
+        page_size = max(limit * 4, 64)
+        await self.connect()
+        async with self._driver.session() as session:
+            while len(candidates) < limit:
+                result = await session.run(
+                    _SOURCE_FULLTEXT_CANDIDATES_CYPHER,
+                    limit=page_size,
+                    skip=offset,
+                    exclude_keys=exclude_source_keys,
+                )
+                records = [record.data() async for record in result]
+                if not records:
+                    break
+                for record in records:
+                    document_text = _build_source_fulltext_text(
+                        canonical_url=str(record["canonical_url"]),
+                        title=str(record.get("title") or ""),
+                        summary=str(record.get("summary") or ""),
+                    )
+                    target_hash = _compute_fulltext_content_hash(
+                        version=self._settings.embedding_version,
+                        text=document_text,
+                    )
+                    if not reindex and not _fulltext_record_is_stale(
+                        record=record,
+                        target_hash=target_hash,
+                        version=self._settings.embedding_version,
+                    ):
+                        continue
+                    candidates.append(
+                        TextIndexCandidate(
+                            source_type=EmbeddingSourceType.source,
+                            source_key=str(record["canonical_url"]),
+                            title=record.get("title"),
+                            summary=record.get("summary"),
+                            document_text=document_text,
+                            target_hash=target_hash,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(records) < page_size:
+                    break
+                offset += page_size
+        return candidates
+
+    async def _list_relation_fulltext_candidates(
+        self,
+        *,
+        limit: int,
+        reindex: bool,
+        exclude_source_keys: list[str],
+    ) -> list[TextIndexCandidate]:
+        candidates: list[TextIndexCandidate] = []
+        offset = 0
+        page_size = max(limit * 4, 64)
+        await self.connect()
+        async with self._driver.session() as session:
+            while len(candidates) < limit:
+                result = await session.run(
+                    _RELATION_FULLTEXT_CANDIDATES_CYPHER,
+                    limit=page_size,
+                    skip=offset,
+                    exclude_keys=exclude_source_keys,
+                )
+                records = [record.data() async for record in result]
+                if not records:
+                    break
+                for record in records:
+                    pair_key = build_relation_pair_key(
+                        str(record["left_entity_id"]),
+                        str(record["right_entity_id"]),
+                    )
+                    document_text = _build_relation_fulltext_text(
+                        left_entity_name=str(record.get("left_entity_name") or record["left_entity_id"]),
+                        right_entity_name=str(record.get("right_entity_name") or record["right_entity_id"]),
+                        aggregated_text=str(record.get("aggregated_text") or ""),
+                    )
+                    target_hash = _compute_fulltext_content_hash(
+                        version=self._settings.embedding_version,
+                        text=document_text,
+                    )
+                    if not reindex and not _fulltext_record_is_stale(
+                        record=record,
+                        target_hash=target_hash,
+                        version=self._settings.embedding_version,
+                    ):
+                        continue
+                    candidates.append(
+                        TextIndexCandidate(
+                            source_type=EmbeddingSourceType.relation,
+                            source_key=pair_key,
+                            aggregated_text=record.get("aggregated_text"),
+                            left_entity_name=record.get("left_entity_name"),
+                            right_entity_name=record.get("right_entity_name"),
+                            document_text=document_text,
+                            target_hash=target_hash,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(records) < page_size:
+                    break
+                offset += page_size
+        return candidates
+
     @staticmethod
     async def _get_entity_embedding_source_tx(tx, entity_id: str) -> dict[str, Any] | None:
         result = await tx.run(_ENTITY_EMBEDDING_SOURCE_CYPHER, entity_id=entity_id)
@@ -1183,22 +1844,20 @@ class Neo4jGraphRepository:
         await tx.run(
             """
             MATCH (entity:Entity {entity_id: $entity_id})
-            OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})-[:EMBEDS]->(entity)
             SET entity.embedding_target_hash = $target_hash,
                 entity.embedding_last_error = CASE
-                    WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $target_hash
+                    WHEN coalesce(entity.embedding_content_hash, '') = $target_hash
                     THEN entity.embedding_last_error
                     ELSE null
                 END,
                 entity.embedding_last_dirty_at = CASE
-                    WHEN embedding IS NOT NULL AND coalesce(embedding.content_hash, '') = $target_hash
+                    WHEN coalesce(entity.embedding_content_hash, '') = $target_hash
                     THEN entity.embedding_last_dirty_at
                     ELSE datetime()
                 END
             """,
             entity_id=entity_id,
             target_hash=target_hash,
-            embedding_key=build_embedding_key(EmbeddingSourceType.entity, entity_id),
         )
 
     @staticmethod
@@ -1213,9 +1872,9 @@ class Neo4jGraphRepository:
                 RETURN entity AS node, null AS related_node, 'entity' AS resolved_type
                 UNION
                 WITH record
-                OPTIONAL MATCH (page:Page {canonical_url: record.source_key})
-                WHERE record.source_type = 'page'
-                RETURN page AS node, null AS related_node, 'page' AS resolved_type
+                OPTIONAL MATCH (source:Source {canonical_url: record.source_key})
+                WHERE record.source_type = 'source'
+                RETURN source AS node, null AS related_node, 'source' AS resolved_type
                 UNION
                 WITH record
                 OPTIONAL MATCH (left:Entity {entity_id: record.left_entity_id})
@@ -1225,25 +1884,31 @@ class Neo4jGraphRepository:
             }
             WITH record, node, related_node, resolved_type
             WHERE node IS NOT NULL
-            MERGE (embedding:Embedding {embedding_key: record.embedding_key})
-            SET embedding.source_type = record.source_type,
-                embedding.source_key = record.source_key,
-                embedding.embedding = record.embedding,
-                embedding.embedding_model = record.embedding_model,
-                embedding.embedding_dim = record.embedding_dim,
-                embedding.embedding_version = record.embedding_version,
-                embedding.content_hash = record.content_hash,
-                embedding.embedding_updated_at = datetime(record.updated_at),
-                embedding.last_error = null
-            FOREACH (_ IN CASE WHEN resolved_type IN ['entity', 'page'] THEN [1] ELSE [] END |
-                MERGE (embedding)-[:EMBEDS]->(node)
-                SET node.embedding_target_hash = record.content_hash,
+            FOREACH (_ IN CASE WHEN resolved_type IN ['entity', 'source'] THEN [1] ELSE [] END |
+                SET node.embedding = record.embedding,
+                    node.embedding_dim = record.embedding_dim,
+                    node.embedding_model = record.embedding_model,
+                    node.embedding_version = record.embedding_version,
+                    node.embedding_content_hash = record.content_hash,
+                    node.embedding_target_hash = record.content_hash,
                     node.embedding_last_synced_at = datetime(record.updated_at),
                     node.embedding_last_error = null
             )
             FOREACH (_ IN CASE WHEN resolved_type = 'relation' AND related_node IS NOT NULL THEN [1] ELSE [] END |
+                MERGE (embedding:Embedding {embedding_key: record.embedding_key})
                 SET embedding.left_entity_id = record.left_entity_id,
+                    embedding.left_entity_name = record.left_entity_name,
+                    embedding.source_type = record.source_type,
+                    embedding.source_key = record.source_key,
+                    embedding.embedding = record.embedding,
+                    embedding.embedding_model = record.embedding_model,
+                    embedding.embedding_dim = record.embedding_dim,
+                    embedding.embedding_version = record.embedding_version,
+                    embedding.content_hash = record.content_hash,
+                    embedding.embedding_updated_at = datetime(record.updated_at),
+                    embedding.last_error = null,
                     embedding.right_entity_id = record.right_entity_id,
+                    embedding.right_entity_name = record.right_entity_name,
                     embedding.aggregated_text = record.aggregated_text,
                     embedding:RelationEmbedding
                 MERGE (embedding)-[:EMBEDS {position: 'left'}]->(node)
@@ -1251,6 +1916,56 @@ class Neo4jGraphRepository:
             )
             """,
             records=records,
+        )
+
+    @staticmethod
+    async def _upsert_fulltext_documents_tx(tx, records: list[dict[str, Any]], version: str) -> None:
+        await tx.run(
+            """
+            UNWIND $records AS record
+            CALL {
+                WITH record
+                OPTIONAL MATCH (entity:Entity {entity_id: record.source_key})
+                WHERE record.source_type = 'entity'
+                SET entity.fulltext_text = record.document_text,
+                    entity.fulltext_content_hash = record.target_hash,
+                    entity.fulltext_version = $version,
+                    entity.fulltext_last_synced_at = datetime(record.updated_at),
+                    entity.fulltext_last_error = null
+                RETURN entity IS NOT NULL AS updated
+                UNION
+                WITH record
+                OPTIONAL MATCH (source:Source {canonical_url: record.source_key})
+                WHERE record.source_type = 'source'
+                SET source.fulltext_text = record.document_text,
+                    source.fulltext_content_hash = record.target_hash,
+                    source.fulltext_version = $version,
+                    source.fulltext_last_synced_at = datetime(record.updated_at),
+                    source.fulltext_last_error = null
+                RETURN source IS NOT NULL AS updated
+                UNION
+                WITH record
+                WHERE record.source_type = 'relation'
+                MERGE (embedding:Embedding {embedding_key: 'relation:' + record.source_key})
+                SET embedding.source_type = record.source_type,
+                    embedding.source_key = record.source_key,
+                    embedding.aggregated_text = record.aggregated_text,
+                    embedding.left_entity_id = split(record.source_key, '::')[0],
+                    embedding.right_entity_id = split(record.source_key, '::')[1],
+                    embedding.left_entity_name = record.left_entity_name,
+                    embedding.right_entity_name = record.right_entity_name,
+                    embedding.fulltext_text = record.document_text,
+                    embedding.fulltext_content_hash = record.target_hash,
+                    embedding.fulltext_version = $version,
+                    embedding.fulltext_last_synced_at = datetime(record.updated_at),
+                    embedding.fulltext_last_error = null,
+                    embedding:RelationEmbedding
+                RETURN true AS updated
+            }
+            RETURN count(*) AS updated_count
+            """,
+            records=records,
+            version=version,
         )
 
     @staticmethod
@@ -1265,13 +1980,13 @@ class Neo4jGraphRepository:
             """
             OPTIONAL MATCH (node)
             WHERE ($source_type = 'entity' AND node:Entity AND node.entity_id = $source_key)
-               OR ($source_type = 'page' AND node:Page AND node.canonical_url = $source_key)
-            OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})
+               OR ($source_type = 'source' AND node:Source AND node.canonical_url = $source_key)
             FOREACH (_ IN CASE WHEN node IS NOT NULL THEN [1] ELSE [] END |
                 SET node.embedding_last_error = $error,
                     node.embedding_last_dirty_at = coalesce(node.embedding_last_dirty_at, datetime())
             )
-            FOREACH (_ IN CASE WHEN embedding IS NOT NULL THEN [1] ELSE [] END |
+            OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})
+            FOREACH (_ IN CASE WHEN embedding IS NOT NULL AND $source_type = 'relation' THEN [1] ELSE [] END |
                 SET embedding.last_error = $error
             )
             """,
@@ -1280,6 +1995,49 @@ class Neo4jGraphRepository:
             error=error,
             embedding_key=build_embedding_key(EmbeddingSourceType(source_type), source_key),
         )
+
+    @staticmethod
+    async def _mark_fulltext_failed_tx(
+        tx,
+        *,
+        source_type: str,
+        source_key: str,
+        error: str,
+    ) -> None:
+        await tx.run(
+            """
+            OPTIONAL MATCH (node)
+            WHERE ($source_type = 'entity' AND node:Entity AND node.entity_id = $source_key)
+               OR ($source_type = 'source' AND node:Source AND node.canonical_url = $source_key)
+            FOREACH (_ IN CASE WHEN node IS NOT NULL THEN [1] ELSE [] END |
+                SET node.fulltext_last_error = $error
+            )
+            OPTIONAL MATCH (embedding:RelationEmbedding {embedding_key: 'relation:' + $source_key})
+            FOREACH (_ IN CASE WHEN embedding IS NOT NULL AND $source_type = 'relation' THEN [1] ELSE [] END |
+                SET embedding.fulltext_last_error = $error
+            )
+            """,
+            source_type=source_type,
+            source_key=source_key,
+            error=error,
+        )
+
+    async def _query_read_records(
+        self,
+        query_name: str,
+        cypher: str,
+        **params: Any,
+    ) -> list[dict[str, Any]]:
+        if self._read_adapter.enabled:
+            try:
+                return await self._read_adapter.query(cypher, params)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("langchain_graph_read_failed", query_name=query_name, error=str(exc))
+
+        await self.connect()
+        async with self._driver.session() as session:
+            result = await session.run(cypher, **params)
+            return [record.data() async for record in result]
 
 
 def _build_entity_payload(
@@ -1562,7 +2320,7 @@ def _build_job_node_payload(
         "graph_update_json": _to_json_string(graph_update),
         "created_entities": list(job.graph_update.created_entities) if job.graph_update else [],
         "updated_entities": list(job.graph_update.updated_entities) if job.graph_update else [],
-        "created_pages": list(job.graph_update.created_pages) if job.graph_update else [],
+        "created_sources": list(job.graph_update.created_sources) if job.graph_update else [],
         "created_relationships": job.graph_update.created_relationships if job.graph_update else 0,
         "deleted_relationships": job.graph_update.deleted_relationships if job.graph_update else 0,
     }
@@ -1604,7 +2362,7 @@ def _build_job_change_log_text(job: JobSummary) -> str:
             [
                 "",
                 "修改记录",
-                f"- 新增页面（{len(job.graph_update.created_pages)}）：{_format_string_list(job.graph_update.created_pages)}",
+                f"- 新增来源（{len(job.graph_update.created_sources)}）：{_format_string_list(job.graph_update.created_sources)}",
                 f"- 新增实体（{len(job.graph_update.created_entities)}）：{_format_string_list(job.graph_update.created_entities)}",
                 f"- 更新实体（{len(job.graph_update.updated_entities)}）：{_format_string_list(job.graph_update.updated_entities)}",
                 f"- 新增关系：{job.graph_update.created_relationships}",
@@ -1619,7 +2377,7 @@ def _build_job_change_log_text(job: JobSummary) -> str:
 def _build_graph_update_summary(update: GraphUpdateResult) -> str:
     return (
         "图谱变更："
-        f"新增页面 {len(update.created_pages)} 个，"
+        f"新增来源 {len(update.created_sources)} 个，"
         f"新增实体 {len(update.created_entities)} 个，"
         f"更新实体 {len(update.updated_entities)} 个，"
         f"新增关系 {update.created_relationships} 条，"
@@ -1627,45 +2385,45 @@ def _build_graph_update_summary(update: GraphUpdateResult) -> str:
     )
 
 
-def _build_page_modification_summary(
+def _build_source_modification_summary(
     *,
     extraction: PageExtraction,
-    page_created: bool,
-    page_update: dict[str, Any],
+    source_created: bool,
+    source_update: dict[str, Any],
 ) -> str:
     parts = [
-        f"页面：{extraction.canonical_url}",
-        "页面状态：新增页面" if page_created else "页面状态：更新已有页面",
-        f"页面摘要长度：{len(extraction.summary)}",
+        f"来源：{extraction.canonical_url}",
+        "来源状态：新增来源" if source_created else "来源状态：更新已有来源",
+        f"来源摘要长度：{len(extraction.summary)}",
         f"抽取实体：{len(extraction.extracted_entities)} 个",
         f"发现链接：{len(extraction.discovered_urls)} 个",
-        f"新增实体：{len(page_update.get('created_entities', []))} 个",
-        f"更新实体：{len(page_update.get('updated_entities', []))} 个",
-        f"新增关系：{page_update.get('created_relationships', 0)} 条",
-        f"删除关系：{page_update.get('deleted_relationships', 0)} 条",
+        f"新增实体：{len(source_update.get('created_entities', []))} 个",
+        f"更新实体：{len(source_update.get('updated_entities', []))} 个",
+        f"新增关系：{source_update.get('created_relationships', 0)} 条",
+        f"删除关系：{source_update.get('deleted_relationships', 0)} 条",
     ]
     return "；".join(parts)
 
 
-def _build_page_change_log(
+def _build_source_change_log(
     *,
     extraction: PageExtraction,
-    page_created: bool,
-    page_update: dict[str, Any],
+    source_created: bool,
+    source_update: dict[str, Any],
 ) -> str:
     lines = [
-        "页面修改详情",
-        f"- 页面 URL：{extraction.canonical_url}",
-        f"- 页面标题：{extraction.title or '无标题'}",
-        f"- 页面状态：{'新增页面' if page_created else '更新已有页面'}",
-        f"- 页面摘要：{extraction.summary or '无摘要'}",
+        "来源修改详情",
+        f"- 来源 URL：{extraction.canonical_url}",
+        f"- 来源标题：{extraction.title or '无标题'}",
+        f"- 来源状态：{'新增来源' if source_created else '更新已有来源'}",
+        f"- 来源摘要：{extraction.summary or '无摘要'}",
         f"- 抽取实体数：{len(extraction.extracted_entities)}",
         f"- 发现链接数：{len(extraction.discovered_urls)}",
-        f"- 新增实体（{len(page_update.get('created_entities', []))}）：{_format_string_list(page_update.get('created_entities', []))}",
-        f"- 更新实体（{len(page_update.get('updated_entities', []))}）：{_format_string_list(page_update.get('updated_entities', []))}",
-        f"- 新增页面引用（{len(page_update.get('created_pages', []))}）：{_format_string_list(page_update.get('created_pages', []))}",
-        f"- 新增关系：{page_update.get('created_relationships', 0)}",
-        f"- 删除关系：{page_update.get('deleted_relationships', 0)}",
+        f"- 新增实体（{len(source_update.get('created_entities', []))}）：{_format_string_list(source_update.get('created_entities', []))}",
+        f"- 更新实体（{len(source_update.get('updated_entities', []))}）：{_format_string_list(source_update.get('updated_entities', []))}",
+        f"- 新增来源引用（{len(source_update.get('created_sources', []))}）：{_format_string_list(source_update.get('created_sources', []))}",
+        f"- 新增关系：{source_update.get('created_relationships', 0)}",
+        f"- 删除关系：{source_update.get('deleted_relationships', 0)}",
     ]
     return "\n".join(lines)
 
@@ -1686,10 +2444,10 @@ def _to_json_string(value: Any) -> str | None:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def _build_page_embedding_target_hash(*, summary: str, version: str) -> str:
+def _build_source_embedding_target_hash(*, summary: str, version: str) -> str:
     return compute_embedding_content_hash(
         version=version,
-        text=build_page_embedding_text(summary),
+        text=build_source_embedding_text(summary),
     )
 
 
@@ -1698,6 +2456,7 @@ def _merge_entity_context_matches(
     vector_matches: list[dict[str, Any]],
     *,
     limit: int,
+    vector_field: str = "vector_score",
 ) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
 
@@ -1714,9 +2473,9 @@ def _merge_entity_context_matches(
         if not entity_id:
             continue
         current = merged.get(entity_id, {**match, "hybrid_score": 0.0})
-        vector_score = float(match.get("vector_score") or 0.0)
+        vector_score = float(match.get(vector_field) or 0.0)
         current["hybrid_score"] = float(current.get("hybrid_score") or 0.0) + vector_score + (1.0 / rank)
-        current["vector_score"] = vector_score
+        current[vector_field] = vector_score
         merged[entity_id] = {**current, **match}
 
     return sorted(
@@ -1729,6 +2488,80 @@ def _merge_entity_context_matches(
         ),
         reverse=True,
     )[:limit]
+
+
+def _merge_index_query_results(
+    fulltext_results: list[IndexQueryResult],
+    vector_results: list[IndexQueryResult],
+    *,
+    limit: int,
+) -> list[IndexQueryResult]:
+    merged: dict[str, IndexQueryResult] = {}
+    for rank, result in enumerate(fulltext_results, start=1):
+        current = merged.get(result.source_key, result.model_copy(deep=True))
+        current.hybrid_score = float(current.hybrid_score or 0.0) + float(result.fulltext_score or 0.0) + (
+            1.5 / rank
+        )
+        current.score = float(current.hybrid_score or 0.0)
+        merged[result.source_key] = current
+    for rank, result in enumerate(vector_results, start=1):
+        current = merged.get(result.source_key, result.model_copy(deep=True))
+        current.vector_score = result.vector_score
+        current.hybrid_score = float(current.hybrid_score or 0.0) + float(result.vector_score or 0.0) + (
+            1.0 / rank
+        )
+        current.score = float(current.hybrid_score or 0.0)
+        merged[result.source_key] = _merge_index_query_result_fields(current, result)
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            float(item.hybrid_score or 0.0),
+            float(item.vector_score or 0.0),
+            float(item.fulltext_score or 0.0),
+            len(item.summary or item.aggregated_text or item.title or item.name or ""),
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def _merge_index_query_result_fields(
+    current: IndexQueryResult,
+    incoming: IndexQueryResult,
+) -> IndexQueryResult:
+    payload = current.model_dump(mode="python")
+    for field, value in incoming.model_dump(mode="python").items():
+        if value in (None, [], ""):
+            continue
+        payload[field] = value
+    return IndexQueryResult.model_validate(payload)
+
+
+def _embedding_candidates_to_samples(candidates: list[EmbeddingCandidate]) -> list[IndexCandidateSample]:
+    return [
+        IndexCandidateSample(
+            source_type=candidate.source_type,
+            source_key=candidate.source_key,
+            target_hash=candidate.target_hash,
+        )
+        for candidate in candidates
+    ]
+
+
+def _text_candidates_to_samples(candidates: list[TextIndexCandidate]) -> list[IndexCandidateSample]:
+    return [
+        IndexCandidateSample(
+            source_type=candidate.source_type,
+            source_key=candidate.source_key,
+            title=candidate.title,
+            name=candidate.name,
+            summary=candidate.summary,
+            aggregated_text=candidate.aggregated_text,
+            left_entity_name=candidate.left_entity_name,
+            right_entity_name=candidate.right_entity_name,
+            target_hash=candidate.target_hash,
+        )
+        for candidate in candidates
+    ]
 
 
 def _embedding_record_is_stale(
@@ -1747,6 +2580,67 @@ def _embedding_record_is_stale(
     )
 
 
+def _fulltext_record_is_stale(
+    *,
+    record: dict[str, Any],
+    target_hash: str,
+    version: str,
+) -> bool:
+    return (
+        not str(record.get("fulltext_content_hash") or "").strip()
+        or str(record.get("fulltext_content_hash") or "") != target_hash
+        or str(record.get("fulltext_version") or "") != version
+        or bool(str(record.get("fulltext_last_error") or "").strip())
+    )
+
+
+def _compute_fulltext_content_hash(*, version: str, text: str) -> str:
+    return compute_embedding_content_hash(version=version, text=text)
+
+
+def _build_entity_fulltext_text(*, name: str, aliases: list[str], summary: str) -> str:
+    parts = [name.strip()]
+    if aliases:
+        parts.append(" ".join(alias.strip() for alias in aliases if str(alias).strip()))
+    if summary.strip():
+        parts.append(summary.strip())
+    return "\n".join(part for part in parts if part)
+
+
+def _build_source_fulltext_text(*, canonical_url: str, title: str, summary: str) -> str:
+    parts = [title.strip(), summary.strip(), canonical_url.strip()]
+    return "\n".join(part for part in parts if part)
+
+
+def _build_relation_fulltext_text(
+    *,
+    left_entity_name: str,
+    right_entity_name: str,
+    aggregated_text: str,
+) -> str:
+    parts = [left_entity_name.strip(), right_entity_name.strip(), aggregated_text.strip()]
+    return "\n".join(part for part in parts if part)
+
+
+def _fulltext_rebuild_statements(scope: IndexScope) -> list[str]:
+    statements: list[str] = []
+    mapping = {
+        IndexScope.entity: ENTITY_FULLTEXT_INDEX_NAME,
+        IndexScope.source: SOURCE_FULLTEXT_INDEX_NAME,
+        IndexScope.relation: RELATION_FULLTEXT_INDEX_NAME,
+    }
+    scopes = [IndexScope.entity, IndexScope.source, IndexScope.relation]
+    for candidate_scope in scopes:
+        if scope not in {IndexScope.all, candidate_scope}:
+            continue
+        statements.append(f"DROP INDEX {mapping[candidate_scope]} IF EXISTS")
+    for candidate_scope in scopes:
+        if scope not in {IndexScope.all, candidate_scope}:
+            continue
+        statements.append(_FULLTEXT_INDEX_CREATE_STATEMENTS[scopes.index(candidate_scope)])
+    return statements
+
+
 _ENTITY_CONTEXT_CYPHER = """
 MATCH (e:Entity)
 WHERE toLower(e.name) CONTAINS toLower($search_text)
@@ -1761,12 +2655,12 @@ OPTIONAL MATCH (e)-[outgoing:RELATED_TO]->()
 WITH e, match_score, count(DISTINCT outgoing) AS outgoing_relations
 OPTIONAL MATCH ()-[incoming:RELATED_TO]->(e)
 WITH e, match_score, outgoing_relations, count(DISTINCT incoming) AS incoming_relations
-OPTIONAL MATCH (e)-[:MENTIONED_IN]->(page:Page)
+OPTIONAL MATCH (e)-[:MENTIONED_IN]->(source:Source)
 WITH e,
      match_score,
      outgoing_relations,
      incoming_relations,
-     count(DISTINCT page) AS mentioned_in_count
+     count(DISTINCT source) AS mentioned_in_count
 RETURN e.entity_id AS entity_id,
        e.name AS name,
        e.category AS category,
@@ -1785,14 +2679,14 @@ LIMIT $limit
 _ENTITY_VECTOR_CONTEXT_CYPHER = """
 CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
 YIELD node, score
-WHERE node:Embedding AND node.source_type = $source_type
-MATCH (node)-[:EMBEDS]->(entity:Entity)
+WHERE node:Entity
+WITH node AS entity, score
 OPTIONAL MATCH (entity)-[outgoing:RELATED_TO]->()
 WITH entity, score, count(DISTINCT outgoing) AS outgoing_relations
 OPTIONAL MATCH ()-[incoming:RELATED_TO]->(entity)
 WITH entity, score, outgoing_relations, count(DISTINCT incoming) AS incoming_relations
-OPTIONAL MATCH (entity)-[:MENTIONED_IN]->(page:Page)
-WITH entity, score, outgoing_relations, incoming_relations, count(DISTINCT page) AS mentioned_in_count
+OPTIONAL MATCH (entity)-[:MENTIONED_IN]->(source:Source)
+WITH entity, score, outgoing_relations, incoming_relations, count(DISTINCT source) AS mentioned_in_count
 RETURN entity.entity_id AS entity_id,
        entity.name AS name,
        entity.category AS category,
@@ -1806,14 +2700,13 @@ ORDER BY score DESC
 LIMIT $limit
 """
 
-_PAGE_VECTOR_QUERY_CYPHER = """
+_SOURCE_VECTOR_QUERY_CYPHER = """
 CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
 YIELD node, score
-WHERE node:Embedding AND node.source_type = $source_type
-MATCH (node)-[:EMBEDS]->(page:Page)
-RETURN page.canonical_url AS source_key,
-       page.title AS title,
-       page.summary AS summary,
+WHERE node:Source
+RETURN node.canonical_url AS source_key,
+       node.title AS title,
+       node.summary AS summary,
        score
 ORDER BY score DESC
 LIMIT $limit
@@ -1822,7 +2715,7 @@ LIMIT $limit
 _RELATION_VECTOR_QUERY_CYPHER = """
 CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
 YIELD node, score
-WHERE node:RelationEmbedding AND node.source_type = $source_type
+WHERE node:RelationEmbedding
 RETURN node.source_key AS source_key,
        node.left_entity_id AS left_entity_id,
        node.right_entity_id AS right_entity_id,
@@ -1833,6 +2726,56 @@ RETURN node.source_key AS source_key,
        score,
        coalesce([(node)-[:EMBEDS {position: 'left'}]->(left:Entity) | left.name][0], node.left_entity_id) AS left_entity_name,
        coalesce([(node)-[:EMBEDS {position: 'right'}]->(right:Entity) | right.name][0], node.right_entity_id) AS right_entity_name
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+_ENTITY_FULLTEXT_QUERY_CYPHER = """
+CALL db.index.fulltext.queryNodes($index_name, $query, {limit: $limit})
+YIELD node, score
+WHERE node:Entity
+OPTIONAL MATCH (node)-[outgoing:RELATED_TO]->()
+WITH node, score, count(DISTINCT outgoing) AS outgoing_relations
+OPTIONAL MATCH ()-[incoming:RELATED_TO]->(node)
+WITH node, score, outgoing_relations, count(DISTINCT incoming) AS incoming_relations
+OPTIONAL MATCH (node)-[:MENTIONED_IN]->(source:Source)
+WITH node, score, outgoing_relations, incoming_relations, count(DISTINCT source) AS mentioned_in_count
+RETURN node.entity_id AS entity_id,
+       node.name AS name,
+       node.category AS category,
+       node.summary AS summary,
+       coalesce(node.aliases, []) AS aliases,
+       outgoing_relations,
+       incoming_relations,
+       mentioned_in_count,
+       score AS fulltext_score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+_SOURCE_FULLTEXT_QUERY_CYPHER = """
+CALL db.index.fulltext.queryNodes($index_name, $query, {limit: $limit})
+YIELD node, score
+WHERE node:Source
+RETURN node.canonical_url AS source_key,
+       node.title AS title,
+       node.summary AS summary,
+       score
+ORDER BY score DESC
+LIMIT $limit
+"""
+
+_RELATION_FULLTEXT_QUERY_CYPHER = """
+CALL db.index.fulltext.queryNodes($index_name, $query, {limit: $limit})
+YIELD node, score
+WHERE node:RelationEmbedding
+RETURN node.source_key AS source_key,
+       node.left_entity_id AS left_entity_id,
+       node.right_entity_id AS right_entity_id,
+       node.left_entity_name AS left_entity_name,
+       node.right_entity_name AS right_entity_name,
+       node.aggregated_text AS aggregated_text,
+       score
 ORDER BY score DESC
 LIMIT $limit
 """
@@ -1858,15 +2801,12 @@ RETURN entity.entity_id AS entity_id,
                evidence: rel.evidence
            }
        ] AS incoming_relations,
-       [(entity)-[:MENTIONED_IN]->(page:Page) | page.canonical_url] AS mentioned_in_pages
+       [(entity)-[:MENTIONED_IN]->(source:Source) | source.canonical_url] AS mentioned_in_sources
 """
 
 _ENTITY_EMBEDDING_CANDIDATES_CYPHER = """
 MATCH (entity:Entity)
 WHERE NOT entity.entity_id IN $exclude_keys
-OPTIONAL MATCH (embedding:Embedding)-[:EMBEDS]->(entity)
-WHERE embedding.embedding_key = 'entity:' + entity.entity_id
-WITH entity, embedding
 RETURN entity.entity_id AS entity_id,
        entity.name AS name,
        entity.category AS category,
@@ -1874,9 +2814,9 @@ RETURN entity.entity_id AS entity_id,
        coalesce(entity.aliases, []) AS aliases,
        entity.embedding_target_hash AS embedding_target_hash,
        entity.embedding_last_error AS embedding_last_error,
-       embedding.content_hash AS embedding_content_hash,
-       embedding.embedding_version AS embedding_version,
-       embedding.embedding_model AS embedding_model,
+       entity.embedding_content_hash AS embedding_content_hash,
+       entity.embedding_version AS embedding_version,
+       entity.embedding_model AS embedding_model,
        [(entity)-[rel:RELATED_TO]->(target:Entity) |
            {
                type: coalesce(rel.relation_type, "RELATED_TO"),
@@ -1891,26 +2831,23 @@ RETURN entity.entity_id AS entity_id,
                evidence: rel.evidence
            }
        ] AS incoming_relations,
-       [(entity)-[:MENTIONED_IN]->(page:Page) | page.canonical_url] AS mentioned_in_pages
+       [(entity)-[:MENTIONED_IN]->(source:Source) | source.canonical_url] AS mentioned_in_sources
 ORDER BY entity.updated_at DESC, entity.name ASC
 SKIP $skip
 LIMIT $limit
 """
 
-_PAGE_EMBEDDING_CANDIDATES_CYPHER = """
-MATCH (page:Page)
-WHERE NOT page.canonical_url IN $exclude_keys
-OPTIONAL MATCH (embedding:Embedding)-[:EMBEDS]->(page)
-WHERE embedding.embedding_key = 'page:' + page.canonical_url
-WITH page, embedding
-RETURN page.canonical_url AS canonical_url,
-       page.summary AS summary,
-       page.embedding_target_hash AS embedding_target_hash,
-       page.embedding_last_error AS embedding_last_error,
-       embedding.content_hash AS embedding_content_hash,
-       embedding.embedding_version AS embedding_version,
-       embedding.embedding_model AS embedding_model
-ORDER BY page.fetched_at DESC, page.canonical_url ASC
+_SOURCE_EMBEDDING_CANDIDATES_CYPHER = """
+MATCH (source:Source)
+WHERE NOT source.canonical_url IN $exclude_keys
+RETURN source.canonical_url AS canonical_url,
+       source.summary AS summary,
+       source.embedding_target_hash AS embedding_target_hash,
+       source.embedding_last_error AS embedding_last_error,
+       source.embedding_content_hash AS embedding_content_hash,
+       source.embedding_version AS embedding_version,
+       source.embedding_model AS embedding_model
+ORDER BY source.fetched_at DESC, source.canonical_url ASC
 SKIP $skip
 LIMIT $limit
 """
@@ -1943,6 +2880,122 @@ ORDER BY left.updated_at DESC, right.updated_at DESC, left.entity_id ASC, right.
 SKIP $skip
 LIMIT $limit
 """
+
+_ENTITY_FULLTEXT_CANDIDATES_CYPHER = """
+MATCH (entity:Entity)
+WHERE NOT entity.entity_id IN $exclude_keys
+RETURN entity.entity_id AS entity_id,
+       entity.name AS name,
+       entity.summary AS summary,
+       coalesce(entity.aliases, []) AS aliases,
+       entity.fulltext_content_hash AS fulltext_content_hash,
+       entity.fulltext_version AS fulltext_version,
+       entity.fulltext_last_error AS fulltext_last_error
+ORDER BY entity.updated_at DESC, entity.name ASC
+SKIP $skip
+LIMIT $limit
+"""
+
+_SOURCE_FULLTEXT_CANDIDATES_CYPHER = """
+MATCH (source:Source)
+WHERE NOT source.canonical_url IN $exclude_keys
+RETURN source.canonical_url AS canonical_url,
+       source.title AS title,
+       source.summary AS summary,
+       source.fulltext_content_hash AS fulltext_content_hash,
+       source.fulltext_version AS fulltext_version,
+       source.fulltext_last_error AS fulltext_last_error
+ORDER BY source.fetched_at DESC, source.canonical_url ASC
+SKIP $skip
+LIMIT $limit
+"""
+
+_RELATION_FULLTEXT_CANDIDATES_CYPHER = """
+MATCH (left:Entity)-[rel:RELATED_TO]-(right:Entity)
+WHERE left.entity_id < right.entity_id
+  AND NOT (left.entity_id + '::' + right.entity_id) IN $exclude_keys
+WITH left, right, collect(coalesce(rel.evidence, "")) AS evidences
+OPTIONAL MATCH (embedding:RelationEmbedding {embedding_key: 'relation:' + left.entity_id + '::' + right.entity_id})
+RETURN left.entity_id AS left_entity_id,
+       left.name AS left_entity_name,
+       right.entity_id AS right_entity_id,
+       right.name AS right_entity_name,
+       reduce(text = "", item IN evidences |
+           CASE
+               WHEN text = "" THEN item
+               WHEN item = "" THEN text
+               ELSE text + " | " + item
+           END
+       ) AS aggregated_text,
+       embedding.fulltext_content_hash AS fulltext_content_hash,
+       embedding.fulltext_version AS fulltext_version,
+       embedding.fulltext_last_error AS fulltext_last_error
+ORDER BY left.updated_at DESC, right.updated_at DESC, left.entity_id ASC, right.entity_id ASC
+SKIP $skip
+LIMIT $limit
+"""
+
+_ENTITY_NEIGHBORHOOD_CYPHER = """
+UNWIND $entity_ids AS entity_id
+MATCH (seed:Entity {entity_id: entity_id})
+CALL {
+    WITH seed
+    MATCH path = (seed)-[rels:RELATED_TO*1..2]-(neighbor:Entity)
+    WHERE seed <> neighbor AND length(path) <= $hops
+    WITH neighbor,
+         rels,
+         length(path) AS hop_count,
+         [rel IN rels | coalesce(rel.relation_type, "RELATED_TO")] AS relation_types,
+         [rel IN rels | coalesce(rel.evidence, "")] AS evidences
+    ORDER BY hop_count ASC, size(coalesce(neighbor.summary, "")) DESC, neighbor.name ASC
+    LIMIT $limit_per_entity
+    RETURN collect(
+        {
+            neighbor_entity_id: neighbor.entity_id,
+            neighbor_name: neighbor.name,
+            hop_count: hop_count,
+            relation_types: relation_types,
+            evidence: reduce(text = "", item IN evidences |
+                CASE
+                    WHEN text = "" THEN item
+                    WHEN item = "" THEN text
+                    ELSE text + " | " + item
+                END
+            )
+        }
+    ) AS neighbors
+}
+RETURN seed.entity_id AS seed_entity_id,
+       seed.name AS seed_name,
+       neighbors
+"""
+
+_SHOW_INDEXES_CYPHER = """
+SHOW INDEXES YIELD name, state, populationPercent, failureMessage
+WHERE name IN $index_names
+RETURN name,
+       state,
+       populationPercent AS population_percent,
+       failureMessage AS failure_message
+"""
+
+_FULLTEXT_INDEX_CREATE_STATEMENTS = [
+    (
+        "CREATE FULLTEXT INDEX "
+        + ENTITY_FULLTEXT_INDEX_NAME
+        + " IF NOT EXISTS FOR (entity:Entity) ON EACH [entity.fulltext_text]"
+    ),
+    (
+        "CREATE FULLTEXT INDEX "
+        + SOURCE_FULLTEXT_INDEX_NAME
+        + " IF NOT EXISTS FOR (source:Source) ON EACH [source.fulltext_text]"
+    ),
+    (
+        "CREATE FULLTEXT INDEX "
+        + RELATION_FULLTEXT_INDEX_NAME
+        + " IF NOT EXISTS FOR (embedding:RelationEmbedding) ON EACH [embedding.fulltext_text]"
+    ),
+]
 
 COMPLETE_ENTITY_SCORE_THRESHOLD = 7
 SUBSTANTIAL_ENTITY_SCORE_THRESHOLD = 4

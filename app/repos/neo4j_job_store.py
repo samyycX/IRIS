@@ -340,7 +340,7 @@ class Neo4jJobStore(JobStore):
                         job.graph_update_json = $graph_update_json,
                         job.created_entities = $created_entities,
                         job.updated_entities = $updated_entities,
-                        job.created_pages = $created_pages,
+                        job.created_sources = $created_sources,
                         job.created_relationships = $created_relationships,
                         job.deleted_relationships = $deleted_relationships,
                         job.resume_available = $resume_available,
@@ -425,7 +425,7 @@ class Neo4jJobStore(JobStore):
             "updated_entities": list(snapshot.job.graph_update.updated_entities)
             if snapshot.job.graph_update
             else [],
-            "created_pages": list(snapshot.job.graph_update.created_pages)
+            "created_sources": list(snapshot.job.graph_update.created_sources)
             if snapshot.job.graph_update
             else [],
             "created_relationships": snapshot.job.graph_update.created_relationships
@@ -572,7 +572,7 @@ class Neo4jJobStore(JobStore):
         if job.graph_update is not None:
             parts.append(
                 "图谱变更："
-                f"新增页面 {len(job.graph_update.created_pages)} 个，"
+                f"新增来源 {len(job.graph_update.created_sources)} 个，"
                 f"新增实体 {len(job.graph_update.created_entities)} 个，"
                 f"更新实体 {len(job.graph_update.updated_entities)} 个，"
                 f"新增关系 {job.graph_update.created_relationships} 条，"
@@ -602,7 +602,7 @@ class Neo4jJobStore(JobStore):
                 [
                     "",
                     "修改记录",
-                    f"- 新增页面（{len(job.graph_update.created_pages)}）：{Neo4jJobStore._format_string_list(job.graph_update.created_pages)}",
+                    f"- 新增来源（{len(job.graph_update.created_sources)}）：{Neo4jJobStore._format_string_list(job.graph_update.created_sources)}",
                     f"- 新增实体（{len(job.graph_update.created_entities)}）：{Neo4jJobStore._format_string_list(job.graph_update.created_entities)}",
                     f"- 更新实体（{len(job.graph_update.updated_entities)}）：{Neo4jJobStore._format_string_list(job.graph_update.updated_entities)}",
                     f"- 新增关系：{job.graph_update.created_relationships}",

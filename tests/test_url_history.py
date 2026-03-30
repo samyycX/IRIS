@@ -7,7 +7,7 @@ from app.repos.url_history import UrlHistoryRepository
 
 
 class DummyGraphRepo:
-    async def page_fetched_since(self, canonical_url: str, cutoff: datetime) -> bool:
+    async def source_fetched_since(self, canonical_url: str, cutoff: datetime) -> bool:
         return False
 
 

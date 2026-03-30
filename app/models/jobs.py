@@ -45,6 +45,7 @@ class ExtractedEntity(BaseModel):
     category: str = "unknown"
     summary: str
     aliases: list[str] = Field(default_factory=list)
+    mentioned_in_score: float | None = Field(default=None, ge=0, le=1)
     relations: list[dict[str, Any]] = Field(default_factory=list)
     deleted_relations: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -62,7 +63,7 @@ class PageExtraction(BaseModel):
 class GraphUpdateResult(BaseModel):
     created_entities: list[str] = Field(default_factory=list)
     updated_entities: list[str] = Field(default_factory=list)
-    created_pages: list[str] = Field(default_factory=list)
+    created_sources: list[str] = Field(default_factory=list)
     created_relationships: int = 0
     deleted_relationships: int = 0
 

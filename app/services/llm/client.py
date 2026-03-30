@@ -11,6 +11,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models import ExtractedEntity
 from app.services.llm.prompts import (
+    build_entity_merge_prompt,
     get_prompt_bundle,
 )
 
@@ -21,11 +22,16 @@ class LLMClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._prompts = get_prompt_bundle(settings.prompt_profile)
-        self._client = AsyncOpenAI(
-            api_key=settings.openai_api_key or "missing-key",
-            base_url=settings.openai_base_url,
-        )
         self.enabled = bool(settings.openai_api_key)
+        self._client = (
+            AsyncOpenAI(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url,
+            )
+            if self.enabled
+            else None
+        )
+        self._merge_chain = self._build_merge_chain() if self.enabled else None
 
     async def extract_knowledge(
         self,
@@ -35,16 +41,7 @@ class LLMClient:
         text: str,
         context: list[dict[str, Any]],
     ) -> tuple[str, list[ExtractedEntity]]:
-        if not self.enabled:
-            logger.info(
-                "llm_extract_knowledge_fallback_disabled",
-                url=url,
-                title=title,
-                text_length=len(text),
-                context_count=len(context),
-            )
-            return self._fallback_extract(title=title, text=text)
-
+        client = self._require_client()
         truncated_text = _truncate_for_llm(text, PAGE_EXTRACTION_TEXT_LIMIT)
         prompt = {
             "url": url,
@@ -64,7 +61,7 @@ class LLMClient:
             context_count=len(context),
         )
         try:
-            response = await self._client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=self._settings.openai_model,
                 response_format={"type": "json_object"},
                 messages=[
@@ -90,7 +87,7 @@ class LLMClient:
                 model=self._settings.openai_model,
             )
             raise
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             logger.warning(
                 "llm_invalid_json",
                 url=url,
@@ -98,7 +95,7 @@ class LLMClient:
                 response_length=len(content),
                 payload=content,
             )
-            return self._fallback_extract(title=title, text=text)
+            raise ValueError("LLM returned invalid JSON for extract_knowledge") from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "llm_request_failed",
@@ -107,7 +104,7 @@ class LLMClient:
                 model=self._settings.openai_model,
                 error=str(exc),
             )
-            return self._fallback_extract(title=title, text=text)
+            raise
         entities = [
             ExtractedEntity.model_validate(entity)
             for entity in payload.get("extracted_entities", [])
@@ -123,36 +120,22 @@ class LLMClient:
     ) -> ExtractedEntity:
         if not existing_entities:
             return incoming_entity
-        if not self.enabled:
-            return self._fallback_merge_entity(
-                incoming_entity=incoming_entity,
-                existing_entities=existing_entities,
-            )
 
         prompt = {
             "incoming_entity": incoming_entity.model_dump(),
             "existing_entities": existing_entities,
         }
         try:
-            response = await self._client.chat.completions.create(
-                model=self._settings.openai_model,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": self._prompts.entity_merge.strip()},
-                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-                ],
+            result = await self._require_merge_chain().ainvoke(
+                {"payload": json.dumps(prompt, ensure_ascii=False)}
             )
-            content = response.choices[0].message.content or "{}"
-            payload = json.loads(content)
-            return ExtractedEntity.model_validate(payload)
-        except json.JSONDecodeError:
-            logger.warning("llm_merge_invalid_json", payload=content)
+            return ExtractedEntity.model_validate(result)
+        except ValueError as exc:
+            logger.warning("llm_merge_invalid_output", error=str(exc))
+            raise ValueError("LLM returned invalid structured output for merge_entity") from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning("llm_merge_failed", error=str(exc))
-        return self._fallback_merge_entity(
-            incoming_entity=incoming_entity,
-            existing_entities=existing_entities,
-        )
+            raise
 
     async def filter_related_urls(
         self,
@@ -167,18 +150,10 @@ class LLMClient:
         normalized_candidates = _normalize_candidate_urls(candidate_urls)
         if not normalized_candidates:
             return []
+        client = self._require_client()
         normalized_candidate_context = _normalize_candidate_url_entity_context(
             candidate_url_entity_context or []
         )
-        if not self.enabled:
-            logger.info(
-                "llm_related_urls_filter_disabled",
-                source_url=source_url,
-                candidate_url_count=len(normalized_candidates),
-                context_count=len(context),
-            )
-            return normalized_candidates
-
         selected_urls: list[str] = []
         batches = _batched(normalized_candidates, size=RELATED_URL_BATCH_SIZE)
         logger.info(
@@ -215,7 +190,7 @@ class LLMClient:
                 truncated_text_length=len(truncated_text),
             )
             try:
-                response = await self._client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=self._settings.openai_model,
                     response_format={"type": "json_object"},
                     messages=[
@@ -251,7 +226,7 @@ class LLMClient:
                     batch_size=len(batch),
                 )
                 raise
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
                 logger.warning(
                     "llm_related_urls_invalid_json",
                     source_url=source_url,
@@ -261,6 +236,7 @@ class LLMClient:
                     response_length=len(content),
                     payload=content,
                 )
+                raise ValueError("LLM returned invalid JSON for filter_related_urls") from exc
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "llm_related_urls_failed",
@@ -271,6 +247,7 @@ class LLMClient:
                     batch_size=len(batch),
                     error=str(exc),
                 )
+                raise
 
         normalized_selected_urls = _normalize_candidate_urls(selected_urls)
         logger.info(
@@ -281,164 +258,27 @@ class LLMClient:
         )
         return normalized_selected_urls
 
-    def _fallback_extract(self, *, title: str | None, text: str) -> tuple[str, list[ExtractedEntity]]:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        summary = "\n".join(lines[:3])[:400] if lines else (title or "未提取到正文内容")
-        entities: list[ExtractedEntity] = []
-        if title:
-            entities.append(
-                ExtractedEntity(
-                    name=title,
-                    category="page_subject",
-                    summary=summary[:300],
-                    aliases=[],
-                    relations=[],
-                )
-            )
-        return summary, entities
+    def _require_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+        return self._client
 
+    def _build_merge_chain(self):
+        from langchain_openai import ChatOpenAI
 
-    def _fallback_merge_entity(
-        self,
-        *,
-        incoming_entity: ExtractedEntity,
-        existing_entities: list[dict[str, Any]],
-    ) -> ExtractedEntity:
-        aliases: list[str] = []
-        summaries = [incoming_entity.summary]
-        categories = [incoming_entity.category]
-        relations = incoming_entity.relations.copy()
-        deleted_relations = incoming_entity.deleted_relations.copy()
-
-        for entity in existing_entities:
-            summaries.append(entity.get("summary", ""))
-            categories.append(entity.get("category", "unknown"))
-            aliases.extend(entity.get("aliases", []))
-            existing_name = entity.get("name")
-            if existing_name:
-                aliases.append(existing_name)
-            relations.extend(entity.get("outgoing_relations", []))
-
-        merged_name = incoming_entity.name.strip() or next(
-            (entity.get("name", "").strip() for entity in existing_entities if entity.get("name", "").strip()),
-            incoming_entity.name,
+        prompt = build_entity_merge_prompt(self._prompts)
+        llm = ChatOpenAI(
+            model=self._settings.openai_model,
+            api_key=self._settings.openai_api_key,
+            base_url=self._settings.openai_base_url,
+            temperature=0,
         )
-        merged_category = next(
-            (
-                category
-                for category in categories
-                if isinstance(category, str) and category.strip() and category.lower() != "unknown"
-            ),
-            "unknown",
-        )
-        merged_summary = max(
-            (summary.strip() for summary in summaries if isinstance(summary, str) and summary.strip()),
-            key=len,
-            default=incoming_entity.summary,
-        )
-        merged_aliases = _dedupe_strings([*incoming_entity.aliases, *aliases], exclude=merged_name)
-        merged_deleted_relations = _dedupe_deleted_relations(deleted_relations)
-        merged_relations = _filter_deleted_relations(
-            _dedupe_relations(relations),
-            merged_deleted_relations,
-        )
+        return prompt | llm.with_structured_output(ExtractedEntity)
 
-        return ExtractedEntity(
-            name=merged_name,
-            category=merged_category,
-            summary=merged_summary,
-            aliases=merged_aliases,
-            relations=merged_relations,
-            deleted_relations=merged_deleted_relations,
-        )
-
-
-def _dedupe_strings(values: list[str], *, exclude: str | None = None) -> list[str]:
-    results: list[str] = []
-    seen: set[str] = set()
-    excluded = exclude.strip().casefold() if exclude and exclude.strip() else None
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        cleaned = " ".join(value.split()).strip()
-        if not cleaned:
-            continue
-        key = cleaned.casefold()
-        if key == excluded or key in seen:
-            continue
-        seen.add(key)
-        results.append(cleaned)
-    return results
-
-
-def _dedupe_relations(relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, str], dict[str, Any]] = {}
-    for relation in relations:
-        relation_type = str(relation.get("type", "RELATED_TO")).strip() or "RELATED_TO"
-        target = str(relation.get("target", "")).strip()
-        if not target:
-            continue
-        evidence = str(relation.get("evidence", "")).strip()
-        key = (relation_type.casefold(), target.casefold())
-        current = merged.get(key)
-        candidate = {
-            "type": relation_type,
-            "target": target,
-            "evidence": evidence,
-        }
-        if current is None or len(candidate["evidence"]) > len(str(current.get("evidence", ""))):
-            merged[key] = candidate
-    return list(merged.values())
-
-
-def _dedupe_deleted_relations(relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, str], dict[str, Any]] = {}
-    for relation in relations:
-        relation_type = str(relation.get("type", "RELATED_TO")).strip() or "RELATED_TO"
-        target = str(relation.get("target", "")).strip()
-        if not target:
-            continue
-        evidence = str(relation.get("evidence", "")).strip()
-        reason = str(relation.get("reason", "")).strip()
-        key = (relation_type.casefold(), target.casefold())
-        candidate = {
-            "type": relation_type,
-            "target": target,
-        }
-        if evidence:
-            candidate["evidence"] = evidence
-        if reason:
-            candidate["reason"] = reason
-        current = merged.get(key)
-        current_score = len(str(current.get("evidence", ""))) + len(str(current.get("reason", ""))) if current else -1
-        candidate_score = len(evidence) + len(reason)
-        if current is None or candidate_score > current_score:
-            merged[key] = candidate
-    return list(merged.values())
-
-
-def _filter_deleted_relations(
-    relations: list[dict[str, Any]],
-    deleted_relations: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    deleted_keys = {
-        (
-            str(relation.get("type", "RELATED_TO")).strip().casefold() or "related_to",
-            str(relation.get("target", "")).strip().casefold(),
-        )
-        for relation in deleted_relations
-        if str(relation.get("target", "")).strip()
-    }
-    return [
-        relation
-        for relation in relations
-        if (
-            str(relation.get("type", "RELATED_TO")).strip().casefold() or "related_to",
-            str(relation.get("target", "")).strip().casefold(),
-        )
-        not in deleted_keys
-    ]
-
+    def _require_merge_chain(self):
+        if self._merge_chain is None:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+        return self._merge_chain
 
 def _normalize_candidate_url_entity_context(
     contexts: list[dict[str, Any]],

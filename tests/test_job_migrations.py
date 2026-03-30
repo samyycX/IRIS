@@ -16,7 +16,7 @@ def test_job_store_can_read_legacy_crawl_job_without_input_type_and_status():
             "seed": "https://example.com/page",
             "created_at": "2026-03-29T12:00:00+00:00",
             "updated_at": "2026-03-29T12:05:00+00:00",
-            "graph_update_json": json.dumps({"created_pages": ["https://example.com/page"]}),
+            "graph_update_json": json.dumps({"created_sources": ["https://example.com/page"]}),
             "request_json": json.dumps({"url": "https://example.com/page"}),
         }
     )
@@ -54,25 +54,20 @@ def test_migration_manager_splits_multiple_statements():
     ]
 
 
-def test_bundled_crawl_job_migration_file_exists():
-    path = Path("E:/programming/IRIS/app/repos/migrations/V1__backfill_crawl_job_schema.cypher")
-    assert path.exists()
-    assert "MATCH (job:CrawlJob)" in path.read_text(encoding="utf-8")
-
-
-def test_bundled_embedding_migration_file_exists():
-    path = Path("E:/programming/IRIS/app/repos/migrations/V2__add_embedding_nodes_and_vector_index.cypher")
+def test_bundled_graph_schema_migration_file_exists():
+    path = Path("E:/programming/IRIS/app/repos/migrations/V1__initialize_graph_schema.cypher")
     assert path.exists()
     content = path.read_text(encoding="utf-8")
-    assert "CREATE VECTOR INDEX embedding_index" in content
+    assert "CREATE CONSTRAINT source_canonical_url" in content
     assert "CREATE CONSTRAINT embedding_embedding_key" in content
+    assert "CREATE VECTOR INDEX entity_embedding_index" in content
+    assert "CREATE VECTOR INDEX source_embedding_index" in content
+    assert "CREATE VECTOR INDEX relation_embedding_index" in content
 
 
-def test_bundled_relation_embedding_migration_file_exists():
-    path = Path(
-        "E:/programming/IRIS/app/repos/migrations/V3__remove_sync_status_and_add_relation_embedding.cypher"
-    )
+def test_bundled_mentioned_in_relevance_migration_file_exists():
+    path = Path("E:/programming/IRIS/app/repos/migrations/V2__backfill_mentioned_in_relevance.cypher")
     assert path.exists()
     content = path.read_text(encoding="utf-8")
-    assert "REMOVE page.embedding_sync_status" in content
-    assert "SET embedding:RelationEmbedding" in content
+    assert "MATCH ()-[rel:MENTIONED_IN]->()" in content
+    assert "SET rel.relevance = 0.5" in content

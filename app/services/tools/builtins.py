@@ -7,6 +7,7 @@ from app.repos.graph_repo import Neo4jGraphRepository
 from app.services.crawl.discovery import LinkDiscoveryService
 from app.services.crawl.extractor import ContentExtractor
 from app.services.crawl.fetcher import HttpFetcher
+from app.services.graphrag.retrievers import EntityContextRetriever
 from app.services.kg.service import KnowledgeGraphService
 from app.services.tools.base import BaseTool
 
@@ -118,10 +119,10 @@ class QueryNeo4jContextTool(BaseTool):
         self._graph_repo = graph_repo
 
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
-        matches = await self._graph_repo.query_entity_context(
-            kwargs["query"],
-            kwargs.get("limit", 5),
-        )
+        matches = await EntityContextRetriever(
+            graph_repo=self._graph_repo,
+            limit=kwargs.get("limit", 5),
+        ).aget_records(kwargs["query"])
         candidate_url_entity_context = await self._graph_repo.query_related_url_entity_context(
             kwargs.get("candidate_urls", []),
             limit_per_url=kwargs.get("candidate_limit", 2),

@@ -4,10 +4,14 @@ from fastapi import APIRouter, HTTPException, Request
 from sse_starlette import EventSourceResponse
 
 from app.models import (
+    IndexJobRequest,
+    IndexPreparationRequest,
+    IndexScope,
+    IndexStatusResponse,
     JobRequest,
     JobStatus,
-    VectorIndexJobRequest,
-    VectorIndexQueryPreviewRequest,
+    SearchPreviewRequest,
+    SearchPreviewResponse,
 )
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -98,37 +102,70 @@ async def stream_job_events(request: Request, job_id: str):
     return EventSourceResponse(container.jobs.stream_events(job_id))
 
 
-@router.post("/vector-index/backfill")
-async def create_vector_backfill_job(request: Request, payload: VectorIndexJobRequest):
+@router.post("/indexing/backfill")
+async def create_index_backfill_job(request: Request, payload: IndexJobRequest):
     container = _container(request)
-    return await container.vector_index.create_backfill_job(payload)
+    return await container.indexing.create_backfill_job(payload)
 
 
-@router.post("/vector-index/reindex")
-async def create_vector_reindex_job(request: Request, payload: VectorIndexJobRequest):
+@router.post("/indexing/reindex")
+async def create_index_reindex_job(request: Request, payload: IndexJobRequest):
     container = _container(request)
-    return await container.vector_index.create_reindex_job(payload)
+    return await container.indexing.create_reindex_job(payload)
 
 
-@router.get("/vector-index/jobs/{job_id}")
-async def get_vector_index_job(request: Request, job_id: str):
+@router.post("/indexing/prepare")
+async def prepare_index_job(request: Request, payload: IndexPreparationRequest):
     container = _container(request)
-    job = await container.vector_index.get_job(job_id)
+    return await container.indexing.prepare(payload)
+
+
+@router.get("/indexing/jobs")
+async def list_index_jobs(request: Request):
+    container = _container(request)
+    return await container.indexing.list_jobs()
+
+
+@router.get("/indexing/jobs/{job_id}")
+async def get_index_job(request: Request, job_id: str):
+    container = _container(request)
+    job = await container.indexing.get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="Vector index job not found")
+        raise HTTPException(status_code=404, detail="Index job not found")
     return job
 
 
-@router.get("/vector-index/jobs/{job_id}/events")
-async def get_vector_index_job_events(request: Request, job_id: str):
+@router.get("/indexing/jobs/{job_id}/events")
+async def get_index_job_events(request: Request, job_id: str):
     container = _container(request)
-    job = await container.vector_index.get_job(job_id)
+    job = await container.indexing.get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="Vector index job not found")
-    return await container.vector_index.get_events(job_id)
+        raise HTTPException(status_code=404, detail="Index job not found")
+    return await container.indexing.get_events(job_id)
 
 
-@router.post("/vector-index/query-preview")
-async def query_vector_index_preview(request: Request, payload: VectorIndexQueryPreviewRequest):
+@router.get("/indexing/status")
+async def get_index_statuses(request: Request) -> IndexStatusResponse:
     container = _container(request)
-    return await container.vector_index.query_preview(payload)
+    return await container.indexing.get_statuses()
+
+
+@router.post("/indexing/fulltext/build")
+async def ensure_fulltext_indexes(request: Request) -> IndexStatusResponse:
+    container = _container(request)
+    return await container.indexing.ensure_fulltext_indexes()
+
+
+@router.post("/indexing/fulltext/rebuild/{scope}")
+async def rebuild_fulltext_indexes(request: Request, scope: IndexScope) -> IndexStatusResponse:
+    container = _container(request)
+    return await container.indexing.rebuild_fulltext_indexes(scope)
+
+
+@router.post("/indexing/query-preview")
+async def query_index_preview(
+    request: Request,
+    payload: SearchPreviewRequest,
+) -> SearchPreviewResponse:
+    container = _container(request)
+    return await container.indexing.query_preview(payload)

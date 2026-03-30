@@ -12,8 +12,8 @@ from app.repos.graph_repo import (
     Neo4jGraphRepository,
     _build_related_url_lookup_terms,
     _build_job_change_log_text,
-    _build_page_change_log,
-    _build_page_modification_summary,
+    _build_source_change_log,
+    _build_source_modification_summary,
     _build_job_summary_text,
     _build_relation_target_summary,
     _build_entity_payload,
@@ -164,7 +164,25 @@ class _FakeTx:
         self.calls.append((query, kwargs))
 
 
-async def test_upsert_page_tx_writes_full_raw_text_excerpt_for_replacement():
+class _FakeSingleResult:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    async def single(self):
+        return self._payload
+
+
+class _FakeTxWithSingleResult(_FakeTx):
+    def __init__(self, payload: dict) -> None:
+        super().__init__()
+        self._payload = payload
+
+    async def run(self, query: str, **kwargs):
+        self.calls.append((query, kwargs))
+        return _FakeSingleResult(self._payload)
+
+
+async def test_upsert_source_tx_writes_full_raw_text_excerpt_for_replacement():
     tx = _FakeTx()
     raw_text = "完整正文" * 600
     extraction = PageExtraction(
@@ -177,11 +195,11 @@ async def test_upsert_page_tx_writes_full_raw_text_excerpt_for_replacement():
         raw_text_excerpt=raw_text,
     )
 
-    await Neo4jGraphRepository._upsert_page_tx(tx, "job-1", extraction)
+    await Neo4jGraphRepository._upsert_source_tx(tx, "job-1", extraction, "hash")
 
     query, params = tx.calls[0]
 
-    assert "page.raw_text_excerpt = $raw_text_excerpt" in query
+    assert "source.raw_text_excerpt = $raw_text_excerpt" in query
     assert params["raw_text_excerpt"] == raw_text
 
 
@@ -199,10 +217,10 @@ async def test_update_visited_relation_tx_stores_page_modification_details():
         content_hash="hash",
         raw_text_excerpt="正文",
     )
-    page_update = {
+    source_update = {
         "created_entities": ["角色甲"],
         "updated_entities": ["角色丙"],
-        "created_pages": ["https://example.com/page"],
+        "created_sources": ["https://example.com/page"],
         "created_relationships": 2,
         "deleted_relationships": 1,
     }
@@ -211,8 +229,8 @@ async def test_update_visited_relation_tx_stores_page_modification_details():
         tx,
         job_id="job-1",
         extraction=extraction,
-        page_created=True,
-        page_update=page_update,
+        source_created=True,
+        source_update=source_update,
     )
 
     query, params = tx.calls[0]
@@ -223,8 +241,91 @@ async def test_update_visited_relation_tx_stores_page_modification_details():
     assert params["updated_entities"] == ["角色丙"]
     assert params["created_relationships"] == 2
     assert params["deleted_relationships"] == 1
-    assert "页面状态：新增页面" in params["modification_summary"]
+    assert "来源状态：新增来源" in params["modification_summary"]
     assert "新增实体（1）：角色甲" in params["change_log"]
+
+
+async def test_upsert_entity_node_tx_sets_mentioned_in_relevance():
+    tx = _FakeTx()
+
+    await Neo4jGraphRepository._upsert_entity_node_tx(
+        tx,
+        canonical_url="https://example.com/page",
+        entity_id="entity-1",
+        name="角色甲",
+        normalized_name="角色甲",
+        category="character",
+        summary="角色甲摘要",
+        aliases=["ROLE_ALPHA"],
+        mentioned_in_score=0.9,
+    )
+
+    query, params = tx.calls[0]
+
+    assert "CASE WHEN $mentioned_in_score IS NULL THEN [] ELSE [1] END" in query
+    assert "MERGE (entity)-[rel:MENTIONED_IN]->(source)" in query
+    assert "SET rel.relevance = $mentioned_in_score" in query
+    assert params["mentioned_in_score"] == 0.9
+
+
+async def test_upsert_entity_node_tx_skips_mentioned_in_when_score_missing():
+    tx = _FakeTx()
+
+    await Neo4jGraphRepository._upsert_entity_node_tx(
+        tx,
+        canonical_url="https://example.com/page",
+        entity_id="entity-1",
+        name="角色甲",
+        normalized_name="角色甲",
+        category="character",
+        summary="角色甲摘要",
+        aliases=["ROLE_ALPHA"],
+        mentioned_in_score=None,
+    )
+
+    _, params = tx.calls[0]
+
+    assert params["mentioned_in_score"] is None
+
+
+async def test_delete_stale_mentioned_in_tx_returns_removed_entities_and_count():
+    tx = _FakeTxWithSingleResult(
+        {
+            "entity_ids": ["entity-1", "entity-2"],
+            "deleted_relationships": 2,
+        }
+    )
+
+    result = await Neo4jGraphRepository._delete_stale_mentioned_in_tx(
+        tx,
+        canonical_url="https://example.com/page",
+        retained_entity_ids=["entity-3"],
+    )
+
+    query, params = tx.calls[0]
+
+    assert "WHERE NOT entity.entity_id IN $retained_entity_ids" in query
+    assert params["retained_entity_ids"] == ["entity-3"]
+    assert result == {
+        "entity_ids": ["entity-1", "entity-2"],
+        "deleted_relationships": 2,
+    }
+
+
+async def test_merge_entity_into_canonical_tx_keeps_higher_mentioned_in_relevance():
+    tx = _FakeTx()
+
+    await Neo4jGraphRepository._merge_entity_into_canonical_tx(
+        tx,
+        canonical_entity_id="entity-1",
+        duplicate_entity_id="entity-2",
+    )
+
+    query, params = tx.calls[0]
+
+    assert "MERGE (canonical)-[merged:MENTIONED_IN]->(source)" in query
+    assert "WHEN merged.relevance >= coalesce(rel.relevance, $default_relevance)" in query
+    assert params["default_relevance"] == 0.5
 
 
 def test_build_job_summary_text_includes_graph_update_and_error_details():
@@ -244,7 +345,7 @@ def test_build_job_summary_text_includes_graph_update_and_error_details():
         graph_update=GraphUpdateResult(
             created_entities=["角色甲", "角色丙"],
             updated_entities=["地区乙"],
-            created_pages=["https://example.com/page-1"],
+            created_sources=["https://example.com/page-1"],
             created_relationships=4,
             deleted_relationships=1,
         ),
@@ -254,12 +355,12 @@ def test_build_job_summary_text_includes_graph_update_and_error_details():
 
     assert "任务状态：completed" in summary
     assert "访问页面：5" in summary
-    assert "图谱变更：新增页面 1 个，新增实体 2 个，更新实体 1 个，新增关系 4 条，删除关系 1 条" in summary
+    assert "图谱变更：新增来源 1 个，新增实体 2 个，更新实体 1 个，新增关系 4 条，删除关系 1 条" in summary
     assert "最近错误：timeout on a nested page" in summary
     assert completed_at.isoformat() in summary
 
 
-def test_build_page_change_log_contains_specific_modification_content():
+def test_build_source_change_log_contains_specific_modification_content():
     extraction = PageExtraction(
         canonical_url="https://example.com/page",
         title="示例页面",
@@ -271,29 +372,29 @@ def test_build_page_change_log_contains_specific_modification_content():
         content_hash="hash",
         raw_text_excerpt="正文",
     )
-    page_update = {
+    source_update = {
         "created_entities": ["角色甲"],
         "updated_entities": ["地区乙"],
-        "created_pages": ["https://example.com/page"],
+        "created_sources": ["https://example.com/page"],
         "created_relationships": 3,
         "deleted_relationships": 1,
     }
 
-    summary = _build_page_modification_summary(
+    summary = _build_source_modification_summary(
         extraction=extraction,
-        page_created=False,
-        page_update=page_update,
+        source_created=False,
+        source_update=source_update,
     )
-    change_log = _build_page_change_log(
+    change_log = _build_source_change_log(
         extraction=extraction,
-        page_created=False,
-        page_update=page_update,
+        source_created=False,
+        source_update=source_update,
     )
 
-    assert "页面状态：更新已有页面" in summary
+    assert "来源状态：更新已有来源" in summary
     assert "新增关系：3 条" in summary
-    assert "页面修改详情" in change_log
-    assert "- 页面摘要：这是页面摘要" in change_log
+    assert "来源修改详情" in change_log
+    assert "- 来源摘要：这是页面摘要" in change_log
     assert "- 新增实体（1）：角色甲" in change_log
     assert "- 更新实体（1）：地区乙" in change_log
 
@@ -314,7 +415,7 @@ def test_build_job_change_log_text_contains_detailed_modification_records():
         graph_update=GraphUpdateResult(
             created_entities=["角色甲", "角色丙"],
             updated_entities=["地区乙"],
-            created_pages=["https://example.com/page-1"],
+            created_sources=["https://example.com/page-1"],
             created_relationships=4,
             deleted_relationships=1,
         ),
@@ -325,7 +426,7 @@ def test_build_job_change_log_text_contains_detailed_modification_records():
     assert "任务概览" in change_log
     assert "- 执行统计：访问页面 5，队列剩余 0，失败数 1" in change_log
     assert "修改记录" in change_log
-    assert "- 新增页面（1）：https://example.com/page-1" in change_log
+    assert "- 新增来源（1）：https://example.com/page-1" in change_log
     assert "- 新增实体（2）：角色甲、角色丙" in change_log
     assert "- 更新实体（1）：地区乙" in change_log
     assert "- 新增关系：4" in change_log

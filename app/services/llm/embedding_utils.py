@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 
-from app.models.vector_index import EmbeddingSourceType
+from app.models.indexing import EmbeddingSourceType
 
 
 def build_embedding_key(source_type: EmbeddingSourceType, source_key: str) -> str:
@@ -22,7 +22,7 @@ def parse_relation_pair_key(pair_key: str) -> tuple[str, str]:
     return left, right
 
 
-def build_page_embedding_text(summary: str | None) -> str:
+def build_source_embedding_text(summary: str | None) -> str:
     return _clean_text(summary or "")
 
 
@@ -34,13 +34,13 @@ def build_entity_embedding_text(
     aliases: Iterable[str],
     outgoing_relations: Iterable[dict[str, str | None]],
     incoming_relations: Iterable[dict[str, str | None]],
-    mentioned_in_pages: Iterable[str],
+    mentioned_in_sources: Iterable[str],
     text_max_chars: int,
 ) -> str:
     alias_text = _join_items(aliases)
     outgoing_text = _join_relation_lines(outgoing_relations, direction="outgoing")
     incoming_text = _join_relation_lines(incoming_relations, direction="incoming")
-    page_text = _join_items(mentioned_in_pages)
+    source_text = _join_items(mentioned_in_sources)
     parts = [
         f"名称：{_clean_text(name)}",
         f"类别：{_clean_text(category or 'unknown')}",
@@ -48,7 +48,7 @@ def build_entity_embedding_text(
         f"别名：{alias_text}",
         f"出边关系：{outgoing_text}",
         f"入边关系：{incoming_text}",
-        f"提及页面：{page_text}",
+        f"提及来源：{source_text}",
     ]
     return _truncate_text("\n".join(parts), max_chars=text_max_chars)
 

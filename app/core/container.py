@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from app.core.config import Settings
 from app.repos import (
+    InMemoryIndexJobStore,
     Neo4jGraphRepository,
     Neo4jJobStore,
     Neo4jMigrationManager,
-    Neo4jVectorIndexJobStore,
     UrlHistoryRepository,
 )
 from app.services.crawl import (
@@ -15,19 +15,20 @@ from app.services.crawl import (
     LinkDiscoveryService,
     URLCanonicalizer,
 )
+from app.services.graphrag import GraphRAGRetriever, GraphRAGWorkflow
 from app.services.jobs import JobService
 from app.services.kg import KnowledgeGraphService
-from app.services.llm import EmbeddingClient, LLMClient, LlmOrchestrator
+from app.services.llm import EmbeddingClient, LLMClient
+from app.services.llm.orchestrator import LlmOrchestrator
+from app.services.indexing import IndexingService
 from app.services.tools import (
     DiscoverLinksTool,
     ExtractMainContentTool,
     FetchUrlTool,
-    QueryNeo4jContextTool,
     ToolExecutor,
     ToolRegistry,
     UpsertKgEntityTool,
 )
-from app.services.vector_index import VectorIndexService
 
 
 class ServiceContainer:
@@ -38,7 +39,7 @@ class ServiceContainer:
         self.embedding_client = EmbeddingClient(settings)
         self.graph_repo = Neo4jGraphRepository(settings, embedding_client=self.embedding_client)
         self.migrations = Neo4jMigrationManager(settings)
-        self.vector_index_job_store = Neo4jVectorIndexJobStore(settings)
+        self.index_job_store = InMemoryIndexJobStore()
 
         self.canonicalizer = URLCanonicalizer()
         self.fetcher = HttpFetcher(settings)
@@ -54,10 +55,12 @@ class ServiceContainer:
         )
         self.llm_client = LLMClient(settings)
         self.kg_service = KnowledgeGraphService(self.graph_repo, self.llm_client)
+        self.graphrag_retriever = GraphRAGRetriever(graph_repo=self.graph_repo)
+        self.graphrag_workflow = GraphRAGWorkflow(settings, self.graphrag_retriever)
 
         self.tool_registry = ToolRegistry()
         self.tool_executor = ToolExecutor(self.tool_registry)
-        self.llm_orchestrator = LlmOrchestrator(self.llm_client, self.tool_executor)
+        self.llm_orchestrator = LlmOrchestrator(self.graphrag_workflow)
         self.pipeline = CrawlPipeline(
             event_store=self.event_store,
             graph_repo=self.graph_repo,
@@ -70,11 +73,11 @@ class ServiceContainer:
             skip_history_seen_urls=settings.skip_history_seen_urls,
         )
         self.jobs = JobService(settings, self.event_store, self.pipeline)
-        self.vector_index = VectorIndexService(
+        self.indexing = IndexingService(
             settings=settings,
             graph_repo=self.graph_repo,
             embedding_client=self.embedding_client,
-            job_store=self.vector_index_job_store,
+            job_store=self.index_job_store,
         )
 
     async def initialize(self) -> None:
@@ -83,9 +86,11 @@ class ServiceContainer:
             ttl_days=self.settings.visited_url_ttl_days,
         )
         self.kg_service = KnowledgeGraphService(self.graph_repo, self.llm_client)
+        self.graphrag_retriever = GraphRAGRetriever(graph_repo=self.graph_repo)
+        self.graphrag_workflow = GraphRAGWorkflow(self.settings, self.graphrag_retriever)
         self.tool_registry = ToolRegistry()
         self.tool_executor = ToolExecutor(self.tool_registry)
-        self.llm_orchestrator = LlmOrchestrator(self.llm_client, self.tool_executor)
+        self.llm_orchestrator = LlmOrchestrator(self.graphrag_workflow)
         self.pipeline = CrawlPipeline(
             event_store=self.event_store,
             graph_repo=self.graph_repo,
@@ -98,20 +103,20 @@ class ServiceContainer:
             skip_history_seen_urls=self.settings.skip_history_seen_urls,
         )
         self.jobs = JobService(self.settings, self.event_store, self.pipeline)
-        self.vector_index = VectorIndexService(
+        self.indexing = IndexingService(
             settings=self.settings,
             graph_repo=self.graph_repo,
             embedding_client=self.embedding_client,
-            job_store=self.vector_index_job_store,
+            job_store=self.index_job_store,
         )
         self._register_tools()
         await self.graph_repo.ensure_constraints()
         await self.migrations.run_migrations()
         await self.jobs.mark_interrupted_jobs()
-        await self.vector_index.initialize()
+        await self.indexing.initialize()
 
     async def close(self) -> None:
-        await self.vector_index.shutdown()
+        await self.indexing.shutdown()
         await self.jobs.shutdown()
         await self.fetcher.close()
         await self.migrations.close()
@@ -121,5 +126,4 @@ class ServiceContainer:
         self.tool_registry.register(FetchUrlTool(self.fetcher, self.extractor, self.discovery))
         self.tool_registry.register(ExtractMainContentTool(self.extractor))
         self.tool_registry.register(DiscoverLinksTool(self.discovery))
-        self.tool_registry.register(QueryNeo4jContextTool(self.graph_repo))
         self.tool_registry.register(UpsertKgEntityTool(self.kg_service))

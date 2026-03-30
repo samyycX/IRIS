@@ -1,4 +1,8 @@
 import json
+import sys
+import types
+
+import pytest
 
 from app.core.config import Settings
 from app.models import ExtractedEntity
@@ -7,130 +11,16 @@ from app.services.llm.client import LLMClient
 from app.services.llm.prompts import GENERIC_PAGE_EXTRACTION_PROMPT, PAGE_EXTRACTION_PROMPT
 
 
-def test_fallback_merge_entity_keeps_richer_existing_and_new_information():
-    client = LLMClient(Settings())
-    incoming = ExtractedEntity(
-        name="角色甲",
-        category="resonator",
-        summary="角色甲是示例知识域中的关键角色，担任地区乙负责人。",
-        aliases=["ROLE_ALPHA"],
-        relations=[
-            {
-                "type": "MENTORS",
-                "target": "角色丙",
-                "evidence": "角色甲指导角色丙。",
-            }
-        ],
-        deleted_relations=[
-            {
-                "type": "LEADS",
-                "target": "地区乙",
-                "reason": "页面明确说明角色甲已不再担任地区乙负责人。",
-            }
-        ],
-    )
-    existing_entities = [
-        {
-            "name": "角色甲",
-            "category": "unknown",
-            "summary": "角色甲与地区乙有关。",
-            "aliases": ["地区乙负责人"],
-            "outgoing_relations": [
-                {
-                    "type": "LEADS",
-                    "target": "地区乙",
-                    "evidence": "角色甲是地区乙负责人。",
-                },
-                {
-                    "type": "LOCATED_IN",
-                    "target": "地区乙",
-                    "evidence": "角色甲常驻地区乙。",
-                },
-            ],
-        }
-    ]
-
-    merged = client._fallback_merge_entity(
-        incoming_entity=incoming,
-        existing_entities=existing_entities,
-    )
-
-    assert merged.name == "角色甲"
-    assert merged.category == "resonator"
-    assert merged.summary == "角色甲是示例知识域中的关键角色，担任地区乙负责人。"
-    assert merged.aliases == ["ROLE_ALPHA", "地区乙负责人"]
-    assert merged.relations == [
-        {
-            "type": "MENTORS",
-            "target": "角色丙",
-            "evidence": "角色甲指导角色丙。",
-        },
-        {
-            "type": "LOCATED_IN",
-            "target": "地区乙",
-            "evidence": "角色甲常驻地区乙。",
-        },
-    ]
-    assert merged.deleted_relations == [
-        {
-            "type": "LEADS",
-            "target": "地区乙",
-            "reason": "页面明确说明角色甲已不再担任地区乙负责人。",
-        }
-    ]
-
-
-def test_fallback_filter_related_urls_prefers_context_related_pages():
+async def test_llm_client_raises_at_call_time_without_openai_api_key():
     client = LLMClient(Settings())
 
-    selected = client._fallback_filter_related_urls(
-        source_url="https://wiki.example.com/wiki/%E5%9C%B0%E5%8C%BA%E4%B9%99",
-        title="地区乙",
-        text="地区乙的负责人是角色甲，角色甲长期驻守地区乙。",
-        context=[{"name": "角色甲", "aliases": ["ROLE_ALPHA"]}],
-        candidate_urls=[
-            "https://wiki.example.com/news/1.4-preview",
-            "https://wiki.example.com/wiki/%E8%A7%92%E8%89%B2%E7%94%B2",
-            "https://wiki.example.com/user/profile",
-        ],
-    )
-
-    assert selected == [
-        "https://wiki.example.com/wiki/%E8%A7%92%E8%89%B2%E7%94%B2",
-        "https://wiki.example.com/news/1.4-preview",
-    ]
-
-
-def test_fallback_filter_related_urls_skips_complete_entity_detail_pages():
-    client = LLMClient(Settings())
-
-    selected = client._fallback_filter_related_urls(
-        source_url="https://wiki.example.com/wiki/%E5%9C%B0%E5%8C%BA%E4%B9%99",
-        title="地区乙",
-        text="地区乙的负责人是角色甲，角色甲长期驻守地区乙。",
-        context=[{"name": "角色甲", "aliases": ["ROLE_ALPHA"]}],
-        candidate_urls=[
-            "https://wiki.example.com/wiki/%E8%A7%92%E8%89%B2%E7%94%B2",
-            "https://wiki.example.com/news/1.4-preview",
-        ],
-        candidate_url_entity_context=[
-            {
-                "url": "https://wiki.example.com/wiki/%E8%A7%92%E8%89%B2%E7%94%B2",
-                "best_match": {
-                    "name": "角色甲",
-                    "category": "resonator",
-                    "summary": "角色甲是地区乙负责人，也是示例知识域中的关键角色，拥有较完整的身份、阵营与关系描述。",
-                    "aliases": ["ROLE_ALPHA", "地区乙负责人"],
-                    "relation_count": 6,
-                    "mentioned_in_count": 4,
-                    "completeness_score": 8,
-                    "completeness_level": "complete",
-                },
-            }
-        ],
-    )
-
-    assert selected == ["https://wiki.example.com/news/1.4-preview"]
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY is not configured"):
+        await client.extract_knowledge(
+            url="https://example.com/page",
+            title="标题",
+            text="正文",
+            context=[],
+        )
 
 
 class _FakeMessage:
@@ -168,29 +58,45 @@ class _FakeOpenAIClient:
         self.chat = _FakeChat(completions)
 
 
-class _FakeEmbeddingResponseItem:
-    def __init__(self, embedding: list[float]) -> None:
-        self.embedding = embedding
-
-
-class _FakeEmbeddingResponse:
-    def __init__(self, data: list[list[float]]) -> None:
-        self.data = [_FakeEmbeddingResponseItem(item) for item in data]
-
-
 class _FakeEmbeddings:
     def __init__(self, data: list[list[float]]) -> None:
         self._data = data
+        self.requests: list[list[str]] = []
+
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.requests.append(list(texts))
+        return self._data
+
+
+class _TestEmbeddingClient(EmbeddingClient):
+    def __init__(self, settings: Settings, embeddings: _FakeEmbeddings) -> None:
+        self._fake_embeddings = embeddings
+        super().__init__(settings)
+
+    def _build_client(self):
+        return self._fake_embeddings
+
+
+class _FakeStructuredChain:
+    def __init__(self, result=None, error: Exception | None = None) -> None:
+        self._result = result
+        self._error = error
         self.requests: list[dict] = []
 
-    async def create(self, **kwargs):
-        self.requests.append(kwargs)
-        return _FakeEmbeddingResponse(self._data)
+    async def ainvoke(self, payload: dict):
+        self.requests.append(payload)
+        if self._error is not None:
+            raise self._error
+        return self._result
 
 
-class _FakeEmbeddingOpenAIClient:
-    def __init__(self, embeddings: _FakeEmbeddings) -> None:
-        self.embeddings = embeddings
+class _TestLLMClient(LLMClient):
+    def __init__(self, settings: Settings, merge_chain: _FakeStructuredChain) -> None:
+        self._fake_merge_chain = merge_chain
+        super().__init__(settings)
+
+    def _build_merge_chain(self):
+        return self._fake_merge_chain
 
 
 async def test_extract_knowledge_truncates_text_before_sending_to_llm():
@@ -198,7 +104,7 @@ async def test_extract_knowledge_truncates_text_before_sending_to_llm():
     completions = _FakeCompletions(['{"summary":"ok","extracted_entities":[]}'])
     client._client = _FakeOpenAIClient(completions)
 
-    text = "a" * 13000
+    text = "a" * 60000
     summary, entities = await client.extract_knowledge(
         url="https://example.com/page",
         title="标题",
@@ -210,8 +116,22 @@ async def test_extract_knowledge_truncates_text_before_sending_to_llm():
 
     assert summary == "ok"
     assert entities == []
-    assert len(payload["text"]) == 12000
-    assert payload["text"] == text[:12000]
+    assert len(payload["text"]) == 50000
+    assert payload["text"] == text[:50000]
+
+
+async def test_extract_knowledge_raises_on_invalid_json_response():
+    client = LLMClient(Settings(openai_api_key="test-key"))
+    completions = _FakeCompletions(["not-json"])
+    client._client = _FakeOpenAIClient(completions)
+
+    with pytest.raises(ValueError, match="extract_knowledge"):
+        await client.extract_knowledge(
+            url="https://example.com/page",
+            title="标题",
+            text="正文",
+            context=[],
+        )
 
 
 async def test_extract_knowledge_uses_wuwa_prompt_profile_by_default():
@@ -300,7 +220,100 @@ async def test_filter_related_urls_uses_context_and_preserves_llm_priority_order
     assert payload["text_excerpt"] == text[:4000]
 
 
+async def test_merge_entity_raises_on_invalid_json_response():
+    client = _TestLLMClient(
+        Settings(openai_api_key="test-key"),
+        _FakeStructuredChain(error=ValueError("invalid payload")),
+    )
+
+    with pytest.raises(ValueError, match="merge_entity"):
+        await client.merge_entity(
+            incoming_entity=ExtractedEntity(
+                name="角色甲",
+                category="resonator",
+                summary="角色甲",
+                aliases=[],
+                mentioned_in_score=1.0,
+                relations=[],
+            ),
+            existing_entities=[
+                {
+                    "name": "角色甲",
+                    "category": "resonator",
+                    "summary": "已有记录",
+                    "aliases": [],
+                    "outgoing_relations": [],
+                }
+            ],
+        )
+
+
+async def test_merge_entity_uses_structured_output_chain():
+    result = ExtractedEntity(
+        name="角色甲",
+        category="resonator",
+        summary="合并后的实体摘要",
+        aliases=["ROLE_ALPHA"],
+        mentioned_in_score=1.0,
+        relations=[{"type": "LEADS", "target": "地区乙", "evidence": "页面明确说明。"}],
+    )
+    chain = _FakeStructuredChain(result=result)
+    client = _TestLLMClient(Settings(openai_api_key="test-key"), chain)
+    incoming = ExtractedEntity(
+        name="角色甲",
+        category="resonator",
+        summary="新摘要",
+        aliases=[],
+        mentioned_in_score=1.0,
+        relations=[],
+    )
+
+    merged = await client.merge_entity(
+        incoming_entity=incoming,
+        existing_entities=[{"name": "角色甲", "summary": "已有摘要"}],
+    )
+
+    assert merged == result
+    assert json.loads(chain.requests[0]["payload"]) == {
+        "incoming_entity": incoming.model_dump(),
+        "existing_entities": [{"name": "角色甲", "summary": "已有摘要"}],
+    }
+
+
 async def test_embedding_client_uses_dedicated_embedding_configuration():
+    embeddings = _FakeEmbeddings([[0.1, 0.2, 0.3]])
+    client = _TestEmbeddingClient(
+        Settings(
+            openai_embedding_api_key="embedding-key",
+            openai_embedding_base_url="https://emb.example.com/v1",
+            openai_embedding_model="mebedding-large",
+            embedding_dimensions=1024,
+        ),
+        embeddings,
+    )
+
+    vector = await client.embed_text("示例摘要")
+
+    assert vector == [0.1, 0.2, 0.3]
+    assert embeddings.requests[0] == ["示例摘要"]
+
+
+def test_embedding_client_builds_langchain_embeddings_with_dedicated_configuration(monkeypatch):
+    captured_kwargs = {}
+
+    class _FakeLangChainEmbeddings:
+        def __init__(self, **kwargs) -> None:
+            captured_kwargs.update(kwargs)
+
+        async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+            return [[0.1] for _ in texts]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langchain_openai",
+        types.SimpleNamespace(OpenAIEmbeddings=_FakeLangChainEmbeddings),
+    )
+
     client = EmbeddingClient(
         Settings(
             openai_embedding_api_key="embedding-key",
@@ -309,14 +322,13 @@ async def test_embedding_client_uses_dedicated_embedding_configuration():
             embedding_dimensions=1024,
         )
     )
-    embeddings = _FakeEmbeddings([[0.1, 0.2, 0.3]])
-    client._client = _FakeEmbeddingOpenAIClient(embeddings)
 
-    vector = await client.embed_text("示例摘要")
-
-    assert vector == [0.1, 0.2, 0.3]
-    assert embeddings.requests[0]["model"] == "mebedding-large"
-    assert embeddings.requests[0]["input"] == ["示例摘要"]
-    assert embeddings.requests[0]["dimensions"] == 1024
+    assert client.enabled is True
+    assert captured_kwargs == {
+        "model": "mebedding-large",
+        "api_key": "embedding-key",
+        "base_url": "https://emb.example.com/v1",
+        "dimensions": 1024,
+    }
 
 

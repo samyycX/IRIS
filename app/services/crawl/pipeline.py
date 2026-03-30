@@ -690,7 +690,7 @@ def merge_graph_updates(left: GraphUpdateResult, right: GraphUpdateResult) -> Gr
     return GraphUpdateResult(
         created_entities=sorted(set(left.created_entities + right.created_entities)),
         updated_entities=sorted(set(left.updated_entities + right.updated_entities)),
-        created_pages=sorted(set(left.created_pages + right.created_pages)),
+        created_sources=sorted(set(left.created_sources + right.created_sources)),
         created_relationships=left.created_relationships + right.created_relationships,
         deleted_relationships=left.deleted_relationships + right.deleted_relationships,
     )

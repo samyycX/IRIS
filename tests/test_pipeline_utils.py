@@ -12,14 +12,14 @@ def test_merge_graph_updates_combines_lists_and_counts():
     left = GraphUpdateResult(
         created_entities=["角色甲"],
         updated_entities=["角色丁"],
-        created_pages=["https://wiki.example.com/a"],
+        created_sources=["https://wiki.example.com/a"],
         created_relationships=2,
         deleted_relationships=1,
     )
     right = GraphUpdateResult(
         created_entities=["角色丁", "角色甲"],
         updated_entities=["角色戊"],
-        created_pages=["https://wiki.example.com/b"],
+        created_sources=["https://wiki.example.com/b"],
         created_relationships=3,
         deleted_relationships=2,
     )
@@ -28,7 +28,7 @@ def test_merge_graph_updates_combines_lists_and_counts():
 
     assert set(merged.created_entities) == {"角色甲", "角色丁"}
     assert set(merged.updated_entities) == {"角色丁", "角色戊"}
-    assert merged.created_pages == [
+    assert merged.created_sources == [
         "https://wiki.example.com/a",
         "https://wiki.example.com/b",
     ]

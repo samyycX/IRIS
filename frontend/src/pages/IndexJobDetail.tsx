@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { Link, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import {
   Card,
@@ -10,8 +10,9 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 
-interface VectorIndexJob {
+interface IndexJob {
   job_id: string
+  index_type: string
   mode: string
   scope: string
   status: string
@@ -34,16 +35,16 @@ interface JobEvent {
   data: any
 }
 
-export default function VectorIndexJobDetail() {
+export default function IndexJobDetail() {
   const { jobId } = useParams<{ jobId: string }>()
   const { t } = useTranslation()
-  const [job, setJob] = useState<VectorIndexJob | null>(null)
+  const [job, setJob] = useState<IndexJob | null>(null)
   const [events, setEvents] = useState<JobEvent[]>([])
   const eventsEndRef = useRef<HTMLDivElement>(null)
 
   const loadJob = async () => {
     try {
-      const res = await fetch(`/api/vector-index/jobs/${jobId}`)
+      const res = await fetch(`/api/indexing/jobs/${jobId}`)
       if (res.ok) {
         setJob(await res.json())
       }
@@ -54,7 +55,7 @@ export default function VectorIndexJobDetail() {
 
   const loadEvents = async () => {
     try {
-      const res = await fetch(`/api/vector-index/jobs/${jobId}/events`)
+      const res = await fetch(`/api/indexing/jobs/${jobId}/events`)
       if (res.ok) {
         setEvents(await res.json())
       }
@@ -66,21 +67,12 @@ export default function VectorIndexJobDetail() {
   useEffect(() => {
     loadJob()
     loadEvents()
-
-    const interval = setInterval(() => {
+    const timer = setInterval(() => {
       loadJob()
       loadEvents()
     }, 2000)
-
-    return () => clearInterval(interval)
+    return () => clearInterval(timer)
   }, [jobId])
-
-  useEffect(() => {
-    if (job?.status === 'completed' || job?.status === 'failed') {
-      // If terminal state, we could clear the interval, but it's okay, 
-      // the effect cleanup handles unmount.
-    }
-  }, [job?.status])
 
   useEffect(() => {
     eventsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -95,32 +87,28 @@ export default function VectorIndexJobDetail() {
       <div className="flex items-center justify-between shrink-0">
         <div className="space-y-1">
           <h1 className="text-2xl font-bold flex items-center gap-3">
-            {t('Vector Index Job Detail')}
-            <Badge variant={
-              job.status === 'completed' ? 'default' :
-              job.status === 'failed' ? 'destructive' : 'secondary'
-            }>
+            {t('Index Job Detail')}
+            <Badge variant={job.status === 'failed' ? 'destructive' : job.status === 'completed' ? 'default' : 'secondary'}>
               {job.status}
             </Badge>
           </h1>
-          <p className="text-sm text-muted-foreground font-mono">
-            {job.job_id}
-          </p>
+          <div className="text-sm text-muted-foreground">
+            {job.index_type} / {job.mode} / {job.scope}
+          </div>
+          <p className="text-sm text-muted-foreground font-mono">{job.job_id}</p>
         </div>
-        <div className="flex gap-2">
-          <Link to="/vector-index">
-            <Button variant="outline">{t('Vector Index Management')}</Button>
-          </Link>
-        </div>
+        <Link to="/indexing">
+          <Button variant="outline">{t('Index Management')}</Button>
+        </Link>
       </div>
 
       <div className="grid gap-6 md:grid-cols-4 shrink-0">
         <Card>
           <CardHeader className="py-4">
-            <CardTitle className="text-sm font-medium text-muted-foreground">{t('Mode')} / {t('Scope')}</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">{t('Index Type')}</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{job.mode} / {job.scope}</div>
+            <div className="text-2xl font-bold">{job.index_type}</div>
           </CardContent>
         </Card>
         <Card>
@@ -155,19 +143,19 @@ export default function VectorIndexJobDetail() {
         </CardHeader>
         <CardContent className="flex-1 overflow-auto bg-muted/30 font-mono text-sm p-4 rounded-b-xl border-t">
           <div className="space-y-3">
-            {events.map((ev) => (
-              <div key={ev.event_id} className="flex gap-4">
+            {events.map((event) => (
+              <div key={event.event_id} className="flex gap-4">
                 <span className="text-muted-foreground shrink-0">
-                  {new Date(ev.created_at).toLocaleTimeString()}
+                  {new Date(event.created_at).toLocaleTimeString()}
                 </span>
                 <span className="text-blue-600 dark:text-blue-400 w-24 shrink-0">
-                  [{ev.stage}]
+                  [{event.stage}]
                 </span>
                 <span className="flex-1">
-                  {ev.message}
-                  {Object.keys(ev.data).length > 0 && (
+                  {event.message}
+                  {Object.keys(event.data || {}).length > 0 && (
                     <span className="ml-2 text-muted-foreground">
-                      {JSON.stringify(ev.data)}
+                      {JSON.stringify(event.data)}
                     </span>
                   )}
                 </span>

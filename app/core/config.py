@@ -41,10 +41,6 @@ class Settings(BaseSettings):
         default="cosine",
         alias="EMBEDDING_SIMILARITY_FUNCTION",
     )
-    neo4j_embedding_index_name: str = Field(
-        default="embedding_index",
-        alias="NEO4J_EMBEDDING_INDEX_NAME",
-    )
 
     neo4j_uri: str = Field(default="neo4j://localhost:7687", alias="NEO4J_URI")
     neo4j_username: str = Field(default="neo4j", alias="NEO4J_USERNAME")

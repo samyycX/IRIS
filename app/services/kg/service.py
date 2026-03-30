@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from app.models import GraphUpdateResult, PageExtraction
+from app.models import ExtractedEntity, GraphUpdateResult, PageExtraction
 from app.repos.graph_repo import Neo4jGraphRepository
 from app.services.llm.client import LLMClient
+
+MIN_MENTIONED_IN_SCORE = 0.05
 
 
 class KnowledgeGraphService:
@@ -17,18 +19,35 @@ class KnowledgeGraphService:
     async def upsert_extraction(self, job_id: str, extraction: PageExtraction) -> GraphUpdateResult:
         merged_entities = []
         for entity in extraction.extracted_entities:
+            prepared_entity = _prepare_entity_for_source_linking(entity)
+            if prepared_entity is None:
+                continue
             existing_entities = await self._graph_repo.query_entity_merge_candidates(
-                entity.name,
-                entity.aliases,
+                prepared_entity.name,
+                prepared_entity.aliases,
+            )
+            merged_entity = await self._llm_client.merge_entity(
+                incoming_entity=prepared_entity,
+                existing_entities=existing_entities,
             )
             merged_entities.append(
-                await self._llm_client.merge_entity(
-                    incoming_entity=entity,
-                    existing_entities=existing_entities,
-                )
+                merged_entity.model_copy(update={"mentioned_in_score": prepared_entity.mentioned_in_score})
             )
 
         merged_extraction = extraction.model_copy(
             update={"extracted_entities": merged_entities},
         )
-        return await self._graph_repo.upsert_page_and_entities(job_id, merged_extraction)
+        return await self._graph_repo.upsert_source_and_entities(job_id, merged_extraction)
+
+
+def _prepare_entity_for_source_linking(entity: ExtractedEntity) -> ExtractedEntity | None:
+    score = _normalize_mentioned_in_score(entity.mentioned_in_score)
+    if score is not None and score < MIN_MENTIONED_IN_SCORE:
+        return None
+    return entity.model_copy(update={"mentioned_in_score": score})
+
+
+def _normalize_mentioned_in_score(score: float | None) -> float | None:
+    if score is None:
+        return None
+    return max(0.0, min(1.0, float(score)))

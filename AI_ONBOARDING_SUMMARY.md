@@ -41,11 +41,12 @@
 5. `app/repos/graph_repo.py`
 6. `app/repos/neo4j_job_store.py`
 7. `app/repos/graph_migrations.py`
-8. `app/services/llm/client.py`
-9. `app/services/tools/builtins.py`
-10. `app/web/routes.py` 和 `app/api/routes.py`
-11. `app/models/jobs.py`
-12. `AI_ONBOARDING_SUMMARY.md` 本文件作为导航
+8. `app/services/graphrag/workflow.py`
+9. `app/services/graphrag/retriever.py` 和 `app/services/graphrag/retrievers.py`
+10. `app/services/llm/client.py`
+11. `app/web/routes.py` 和 `app/api/routes.py`
+12. `app/models/jobs.py`
+13. `AI_ONBOARDING_SUMMARY.md` 本文件作为导航
 
 ---
 
@@ -61,8 +62,8 @@
    - 检查当前任务和全局是否已抓取
    - 调用 `fetch_url` 工具抓取页面
    - 抽取正文、标题、链接
-   - 查询现有图谱上下文，并调用 LLM 生成摘要、实体关系
-  - 让 LLM 结合页面内容、图谱上下文，以及候选链接在图谱中的实体完备度筛选关联链接，并按重要度排序后继续加入队列
+   - 调用 LangChain GraphRAG workflow，先做图检索，再做邻域扩展、结构化抽取和候选链接评分
+   - GraphRAG 检索会综合 `Entity` 向量/关键词召回、`Source` 向量召回、`RelationEmbedding` 召回和实体邻域扩展
    - 调用 `upsert_kg_entity` 写入 Neo4j
    - 持续递归抓取，直到达到深度或页面数量上限
 5. `app/repos/neo4j_job_store.py` 持久化任务状态、事件、checkpoint 和恢复信息。
@@ -88,7 +89,7 @@
 - Neo4j 迁移管理器
 - URL 历史文件仓库
 - 抓取器、抽取器、链接发现器
-- LLM 客户端和编排器
+- LLM 客户端、GraphRAG retriever 和 workflow
 - Tool 注册中心和执行器
 - 任务服务
 
@@ -119,7 +120,16 @@
 - `ToolExecutor`：统一调用入口
 - `builtins.py`：当前内置工具集合
 
-以后要新增“站点适配器工具”、“浏览器渲染工具”、“向量检索工具”、“图谱清洗工具”，都应该沿这个体系扩展。
+现在 Tool 体系主要保留给抓取和写图库；GraphRAG 主链路已经不再依赖自定义图查询 Tool。
+
+### 5.5 `GraphRAG` 体系
+
+`app/services/graphrag/` 是当前图检索和 LangChain 编排核心：
+
+- `retrievers.py`：LangChain 自定义 retriever，分别封装实体、来源和关系查询
+- `retriever.py`：聚合多个 retriever，并补齐邻域扩展和候选 URL 实体信号
+- `context_builder.py`：把图上下文压缩为适合 prompt 的文档块
+- `workflow.py`：用 LangGraph 串起 `retrieve -> extract -> rank links`
 
 ---
 
@@ -311,7 +321,7 @@
   - 建立唯一约束
   - 查询已有实体上下文
   - 判断页面是否已存在
-  - 写入 `Page`、`CrawlJob`、`Entity`
+  - 写入 `Source`、`CrawlJob`、`Entity`
   - 为 `CrawlJob` 持久化任务 summary、请求快照、图谱变更摘要和详细修改记录
   - 维护 `VISITED`、`LINKS_TO`、`MENTIONED_IN`、`RELATED_TO` 关系
 
@@ -391,9 +401,9 @@
 
 #### `app/services/llm/prompts.py`
 
-- 当前页面结构化抽取的系统提示词与 prompt preset 定义。
+- 当前 GraphRAG 结构化抽取和链接评分的系统提示词与 prompt preset 定义。
 - 默认 `wuwa` preset 会保留历史鸣潮版 prompt 文本，`generic` preset 提供更中性的提示词。
-- 约束 LLM 输出 JSON，包含页面摘要与实体关系。
+- 约束 LangChain structured output 的语义结构，包含页面摘要、实体关系和候选链接排序结果。
 
 #### `app/services/llm/client.py`
 
@@ -408,11 +418,10 @@
 
 #### `app/services/llm/orchestrator.py`
 
-- LLM 编排层。
-- 先调用 `query_neo4j_context` 取现有图谱上下文，并为候选链接补充“对应实体是否已在图谱中较完整”的检索结果，再调用 `LLMClient`。
-- 把 LLM 结果重新包装为 `PageExtraction`。
+- LLM 入口适配层。
+- 现在主要负责把 `CrawlPipeline` 的调用转发到 `GraphRAGWorkflow`，并把输出统一包装回 `PageExtraction`。
 
-这层是以后做“多轮工具调用”和“更智能上下文拼接”的最佳位置。
+真正的图检索和 LangChain 编排已经下沉到 `app/services/graphrag/`。
 
 ---
 
@@ -464,11 +473,10 @@
   - `fetch_url`
   - `extract_main_content`
   - `discover_links`
-  - `query_neo4j_context`
   - `upsert_kg_entity`
 - 其中 `upsert_kg_entity` 现在既能新增关系，也能按实体描述删除指定 `RELATED_TO` 关系。
 
-这是当前“可扩展能力”的主要锚点。新增 Tool 就按这里的模式继续写。
+这些 Tool 现在主要服务于抓取和写图；图检索不再通过 `query_neo4j_context` 这类自定义 Tool 驱动主链路。
 
 ---
 
@@ -566,7 +574,7 @@
 2. 继承 `BaseTool`。
 3. 定义 `name`、`description`、`schema`、`execute()`。
 4. 在 `app/core/container.py` 的 `_register_tools()` 里注册。
-5. 在 `app/services/llm/orchestrator.py` 或 `app/services/crawl/pipeline.py` 中接入调用。
+5. 如果是抓取/写图能力，可在 `app/services/crawl/pipeline.py` 中接入；如果是图检索或抽取链路，优先进入 `app/services/graphrag/`，而不是回退到旧式 LLM Tool 编排。
 
 ### 如果要改图谱结构
 
@@ -618,7 +626,7 @@ pip install -e .[dev]
 
 ## 10. 给后续 AI 的一句建议
 
-这个项目目前最适合沿着“保留单体结构，但把业务规则继续往服务层和 Tool 层拆”这个方向演进。不要急着引入复杂框架，先把：
+这个项目目前最适合沿着“保留单体结构，但把抓取、GraphRAG 检索、图谱写入继续分层”这个方向演进。优先保持：
 
 - 更强的实体对齐
 - 更可靠的站点适配

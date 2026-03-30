@@ -10,6 +10,17 @@ class PromptBundle:
     entity_merge: str
 
 
+PAGE_EXTRACTION_HUMAN_TEMPLATE = (
+    "URL: {url}\n标题: {title}\nGraphRAG上下文:\n{graph_context}\n\n正文:\n{text}"
+)
+RELATED_URL_FILTER_HUMAN_TEMPLATE = (
+    "来源URL: {source_url}\n标题: {title}\nGraphRAG上下文:\n{graph_context}\n\n"
+    "正文摘录:\n{text_excerpt}\n\n候选URL:\n{candidate_urls}\n\n"
+    "候选URL实体信号:\n{candidate_url_entity_context}"
+)
+ENTITY_MERGE_HUMAN_TEMPLATE = "{payload}"
+
+
 PAGE_EXTRACTION_PROMPT = """
 你是一个用于构建《鸣潮》知识图谱的信息抽取系统。使用简体中文。
 
@@ -17,11 +28,12 @@ PAGE_EXTRACTION_PROMPT = """
 1. 阅读给定网页正文和现有图谱上下文。
 2. 抽取适合进入知识图谱的实体，不要漏掉页面中明确出现且有图谱价值的对象。
 3. 为每个实体给出类别、别名列表，以及能直接写入知识图谱的详细事实说明。
-4. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
-5. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
-6. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
-7. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
-8. 和鸣潮无关联的内容不要抽取。
+4. 为每个实体输出它与当前 Source 的 `mentioned_in_score`，范围是 0 到 1。
+5. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
+6. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
+7. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
+8. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
+9. 和鸣潮无关联的内容不要抽取。
 
 抽取原则：
 - 只记录文本中可以明确支持的信息，不要臆测。
@@ -29,6 +41,8 @@ PAGE_EXTRACTION_PROMPT = """
 - `summary` 字段虽然叫 summary，但这里必须写成“可直接入库的详细事实说明”，尽量覆盖身份、特点、能力、关系、时间、地点、数值等关键信息。
 - 如果上下文里已有同名或近义实体，应尽量沿用已有语义，避免把同一对象拆成多个实体。
 - `aliases` 只放真正的别名、称呼、简称、英文名、旧称，不要把普通描述句塞进去。
+- `mentioned_in_score=1` 表示该 Source 基本就是在专门介绍这个实体；如果只是轻微带过，应给很低的分数。
+- 如果你判断某个实体与当前 Source 的关联度低于 `0.05`，直接不要输出这个实体。
 - `relations` 中每一项都要有明确目标对象，`type` 要具体稳定，`evidence` 要尽量摘录原文中的支持信息。
 - `deleted_relations` 只在页面有明确否定证据时输出，每项至少包含 `type` 和 `target`；如果同一关系同时出现在 `relations` 和 `deleted_relations`，以 `deleted_relations` 为准。
 
@@ -42,6 +56,7 @@ PAGE_EXTRACTION_PROMPT = """
     - category: 字符串
     - summary: 字符串，必须是详细事实说明，而不是一句空泛概述
     - aliases: 字符串数组
+    - mentioned_in_score: 数字，范围 0 到 1，表示该实体和当前 Source 的关联度
     - relations: 数组，每项包含 type、target、evidence
     - deleted_relations: 数组，可选；每项至少包含 type、target，必要时可附带 reason 或 evidence
 """
@@ -113,11 +128,12 @@ GENERIC_PAGE_EXTRACTION_PROMPT = """
 1. 阅读给定网页正文和现有图谱上下文。
 2. 抽取适合进入知识图谱的实体，不要漏掉页面中明确出现且有图谱价值的对象。
 3. 为每个实体给出类别、别名列表，以及能直接写入知识图谱的详细事实说明。
-4. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
-5. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
-6. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
-7. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
-8. 只抽取与当前页面主题和当前任务目标明确相关的内容。
+4. 为每个实体输出它与当前 Source 的 `mentioned_in_score`，范围是 0 到 1。
+5. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
+6. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
+7. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
+8. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
+9. 只抽取与当前页面主题和当前任务目标明确相关的内容。
 
 抽取原则：
 - 只记录文本中可以明确支持的信息，不要臆测。
@@ -125,6 +141,8 @@ GENERIC_PAGE_EXTRACTION_PROMPT = """
 - `summary` 字段虽然叫 summary，但这里必须写成“可直接入库的详细事实说明”，尽量覆盖身份、特点、能力、关系、时间、地点、数值等关键信息。
 - 如果上下文里已有同名或近义实体，应尽量沿用已有语义，避免把同一对象拆成多个实体。
 - `aliases` 只放真正的别名、称呼、简称、英文名、旧称，不要把普通描述句塞进去。
+- `mentioned_in_score=1` 表示该 Source 基本就是在专门介绍这个实体；如果只是轻微带过，应给很低的分数。
+- 如果你判断某个实体与当前 Source 的关联度低于 `0.05`，直接不要输出这个实体。
 - `relations` 中每一项都要有明确目标对象，`type` 要具体稳定，`evidence` 要尽量摘录原文中的支持信息。
 - `deleted_relations` 只在页面有明确否定证据时输出，每项至少包含 `type` 和 `target`；如果同一关系同时出现在 `relations` 和 `deleted_relations`，以 `deleted_relations` 为准。
 
@@ -138,6 +156,7 @@ GENERIC_PAGE_EXTRACTION_PROMPT = """
     - category: 字符串
     - summary: 字符串，必须是详细事实说明，而不是一句空泛概述
     - aliases: 字符串数组
+    - mentioned_in_score: 数字，范围 0 到 1，表示该实体和当前 Source 的关联度
     - relations: 数组，每项包含 type、target、evidence
     - deleted_relations: 数组，可选；每项至少包含 type、target，必要时可附带 reason 或 evidence
 """
@@ -189,3 +208,36 @@ PROMPT_PRESETS = {
 def get_prompt_bundle(profile: str | None) -> PromptBundle:
     profile_key = (profile or DEFAULT_PROMPT_PROFILE).strip().casefold()
     return PROMPT_PRESETS.get(profile_key, PROMPT_PRESETS[DEFAULT_PROMPT_PROFILE])
+
+
+def build_page_extraction_prompt(prompt_bundle: PromptBundle):
+    from langchain_core.prompts import ChatPromptTemplate
+
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", prompt_bundle.page_extraction.strip()),
+            ("human", PAGE_EXTRACTION_HUMAN_TEMPLATE),
+        ]
+    )
+
+
+def build_related_url_filter_prompt(prompt_bundle: PromptBundle):
+    from langchain_core.prompts import ChatPromptTemplate
+
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", prompt_bundle.related_url_filter.strip()),
+            ("human", RELATED_URL_FILTER_HUMAN_TEMPLATE),
+        ]
+    )
+
+
+def build_entity_merge_prompt(prompt_bundle: PromptBundle):
+    from langchain_core.prompts import ChatPromptTemplate
+
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", prompt_bundle.entity_merge.strip()),
+            ("human", ENTITY_MERGE_HUMAN_TEMPLATE),
+        ]
+    )

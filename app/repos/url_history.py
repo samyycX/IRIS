@@ -19,7 +19,7 @@ class UrlHistoryRepository:
 
     async def has_seen(self, canonical_url: str) -> bool:
         cutoff = self._cutoff()
-        return await self._graph_repo.page_fetched_since(canonical_url, cutoff)
+        return await self._graph_repo.source_fetched_since(canonical_url, cutoff)
 
     def _cutoff(self) -> datetime:
         return self._now_provider() - self._ttl
