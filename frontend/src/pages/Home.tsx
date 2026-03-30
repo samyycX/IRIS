@@ -156,74 +156,74 @@ export default function Home() {
     <div className="grid gap-8">
       <Card>
         <CardHeader>
-          <CardTitle>{t('Create Task')}</CardTitle>
+          <CardTitle>{t('crawl.create_task')}</CardTitle>
           <CardDescription>Submit a new knowledge graph construction task.</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="grid gap-6">
             <div className="grid gap-2">
-              <Label>{t('Task Type')}</Label>
+              <Label>{t('crawl.task_type')}</Label>
               <Select value={inputType} onValueChange={(val) => setInputType(val || 'url')}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="url">URL</SelectItem>
-                  <SelectItem value="instruction">{t('Instruction')}</SelectItem>
-                  <SelectItem value="entity">{t('Entity Name')}</SelectItem>
+                  <SelectItem value="instruction">{t('crawl.instruction')}</SelectItem>
+                  <SelectItem value="entity">{t('crawl.entity_name')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
 
             {inputType === 'url' && (
               <div className="grid gap-2">
-                <Label>{t('URL')}</Label>
-                <Input value={url} onChange={e => setUrl(e.target.value)} placeholder={t('URL Placeholder')} type="url" required />
+                <Label>{t('crawl.url')}</Label>
+                <Input value={url} onChange={e => setUrl(e.target.value)} placeholder={t('crawl.url_placeholder')} type="url" required />
               </div>
             )}
 
             {inputType === 'instruction' && (
               <div className="grid gap-2">
-                <Label>{t('Instruction')}</Label>
-                <Textarea value={instruction} onChange={e => setInstruction(e.target.value)} placeholder={t('Instruction Placeholder')} required rows={4} />
+                <Label>{t('crawl.instruction')}</Label>
+                <Textarea value={instruction} onChange={e => setInstruction(e.target.value)} placeholder={t('crawl.instruction_placeholder')} required rows={4} />
               </div>
             )}
 
             {inputType === 'entity' && (
               <div className="grid gap-2">
-                <Label>{t('Entity Name')}</Label>
-                <Input value={entityName} onChange={e => setEntityName(e.target.value)} placeholder={t('Entity Placeholder')} required />
+                <Label>{t('crawl.entity_name')}</Label>
+                <Input value={entityName} onChange={e => setEntityName(e.target.value)} placeholder={t('crawl.entity_placeholder')} required />
               </div>
             )}
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               <div className="grid gap-2">
-                <Label>{t('Max Depth')}</Label>
+                <Label>{t('crawl.max_depth')}</Label>
                 <Input value={maxDepth} onChange={e => setMaxDepth(e.target.value)} type="number" min="0" />
               </div>
               <div className="grid gap-2">
-                <Label>{t('Max Pages')}</Label>
+                <Label>{t('crawl.max_pages')}</Label>
                 <Input value={maxPages} onChange={e => setMaxPages(e.target.value)} type="number" min="1" />
               </div>
               <div className="grid gap-2">
-                <Label>{t('Concurrency')}</Label>
+                <Label>{t('crawl.concurrency')}</Label>
                 <Input value={concurrency} onChange={e => setConcurrency(e.target.value)} type="number" min="1" />
               </div>
             </div>
 
             <div className="flex items-center space-x-2">
               <Checkbox id="filterUrls" checked={filterUrls} onCheckedChange={(checked) => setFilterUrls(checked as boolean)} />
-              <Label htmlFor="filterUrls" className="cursor-pointer">{t('Filter URLs')}</Label>
+              <Label htmlFor="filterUrls" className="cursor-pointer">{t('crawl.filter_urls')}</Label>
             </div>
 
-            <Button type="submit" className="w-full md:w-auto justify-self-start">{t('Submit')}</Button>
+            <Button type="submit" className="w-full md:w-auto justify-self-start">{t('crawl.submit')}</Button>
           </form>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>{t('Task History')}</CardTitle>
+          <CardTitle>{t('crawl.task_history')}</CardTitle>
         </CardHeader>
         <CardContent>
           {jobs.length > 0 ? (
@@ -231,13 +231,13 @@ export default function Home() {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead>{t('Job ID')}</TableHead>
-                    <TableHead>{t('Type')}</TableHead>
-                    <TableHead>{t('Seed')}</TableHead>
-                    <TableHead>{t('Status')}</TableHead>
-                    <TableHead className="text-right">{t('Visited')}</TableHead>
-                    <TableHead className="text-right">{t('Failed')}</TableHead>
-                    <TableHead className="text-right">{t('Actions')}</TableHead>
+                    <TableHead>{t('job.id')}</TableHead>
+                    <TableHead>{t('job.type')}</TableHead>
+                    <TableHead>{t('job.seed')}</TableHead>
+                    <TableHead>{t('job.status')}</TableHead>
+                    <TableHead className="text-right">{t('job.visited')}</TableHead>
+                    <TableHead className="text-right">{t('job.failed')}</TableHead>
+                    <TableHead className="text-right">{t('job.actions')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -261,22 +261,22 @@ export default function Home() {
                         <div className="flex justify-end gap-2">
                         {job.status === 'queued' || job.status === 'running' ? (
                           <Button variant="outline" size="sm" onClick={() => handlePause(job.job_id)}>
-                            {t('Pause')}
+                            {t('job.pause')}
                           </Button>
                         ) : null}
                         {job.status !== 'completed' && job.status !== 'cancelled' ? (
                           <Button variant="destructive" size="sm" onClick={() => handleCancel(job.job_id)}>
-                            {t('Cancel')}
+                            {t('job.cancel')}
                           </Button>
                         ) : null}
                         {job.resume_available && (job.status === 'interrupted' || job.status === 'failed') ? (
                           <Button variant="outline" size="sm" onClick={() => handleResume(job.job_id)}>
-                            {t('Resume')}
+                            {t('job.resume')}
                           </Button>
                         ) : null}
                         {job.resume_available && job.status === 'paused' ? (
                           <Button variant="outline" size="sm" onClick={() => handleResume(job.job_id)}>
-                            {t('Resume')}
+                            {t('job.resume')}
                           </Button>
                         ) : null}
                         </div>
@@ -287,7 +287,7 @@ export default function Home() {
               </Table>
             </div>
           ) : (
-            <p className="text-muted-foreground text-sm">{t('No tasks')}</p>
+            <p className="text-muted-foreground text-sm">{t('crawl.no_tasks')}</p>
           )}
         </CardContent>
       </Card>

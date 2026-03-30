@@ -45,6 +45,8 @@ class LlmOrchestrator:
             "llm_analyze_page_complete",
             canonical_url=canonical_url,
             elapsed_ms=_elapsed_ms(started_at),
+            is_relevant=extraction.is_relevant,
+            irrelevant_reason=extraction.irrelevant_reason,
             summary_length=len(extraction.summary),
             entity_count=len(extraction.extracted_entities),
             selected_url_count=len(extraction.discovered_urls),

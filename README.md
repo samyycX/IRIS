@@ -46,6 +46,14 @@ python -m app.main
 SKIP_HISTORY_SEEN_URLS=false
 ```
 
+如果希望 URL 采集任务在本次任务确实写入了实体或关系后，自动创建全文和向量索引的 `backfill` 任务，可在 `.env` 中开启：
+
+```bash
+AUTO_BACKFILL_INDEXES_AFTER_CRAWL=true
+```
+
+开启后，采集任务完成时会根据本次累计图谱变更自动触发索引补全，只处理缺失或过期的索引数据；若当前没有实际图谱更新，则不会额外创建索引任务。
+
 ## Job 持久化与续跑
 
 前端首页和任务详情页显示的 job 列表，现在以 Neo4j 中的 `CrawlJob` 为事实来源，而不是进程内临时状态。
@@ -68,16 +76,17 @@ SKIP_HISTORY_SEEN_URLS=false
 
 新增迁移时，直接放一个新的 `.cypher` 文件即可。不要修改已经执行过的旧迁移文件；如果要修正历史结构，应新增更高版本的迁移。
 
-## Prompt 配置
+## 主题过滤配置
 
-LLM prompt 现在可以通过 `.env` 中的 `PROMPT_PROFILE` 切换。
+LLM 现在统一使用一套 prompt，不再通过 `PROMPT_PROFILE` 切换。
 
-- 默认值 `wuwa` 会继续使用当前仓库中的原始鸣潮版 prompt，以保持现有行为不变。
-- 如果需要更中性的抽取提示，可改为：
+如果希望采集器只保留某个主题下的页面，可以在 `.env` 中配置：
 
 ```bash
-PROMPT_PROFILE=generic
+KNOWLEDGE_THEME=鸣潮角色、剧情、组织与世界观
 ```
+
+当 `KNOWLEDGE_THEME` 非空时，采集器会先判断页面是否与该主题相关；不相关的页面不会写入数据库，也不会抽取任何实体或关系。
 
 ## 动态页面抓取
 

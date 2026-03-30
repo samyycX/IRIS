@@ -12,7 +12,7 @@
 
 ## 1. 项目一句话说明
 
-这是一个面向通用知识图谱构建的 Python 单体应用。它支持从 URL、文本指令或实体名发起任务，自动抓取网页、抽取正文、调用 OpenAI 兼容 LLM 生成结构化知识，并把页面、实体、关系写入 Neo4j，同时把任务状态、事件流、checkpoint 和图谱更新摘要持久化到 Neo4j `CrawlJob`。当前默认 `PROMPT_PROFILE=wuwa`，因此默认提示词行为仍保持与历史项目一致。
+这是一个面向通用知识图谱构建的 Python 单体应用。它支持从 URL、文本指令或实体名发起任务，自动抓取网页、抽取正文、调用 OpenAI 兼容 LLM 生成结构化知识，并把页面、实体、关系写入 Neo4j，同时把任务状态、事件流、checkpoint 和图谱更新摘要持久化到 Neo4j `CrawlJob`。当前提示词已统一为单一版本，可通过 `KNOWLEDGE_THEME` 控制采集时只保留和指定主题相关的页面。
 
 ---
 
@@ -150,6 +150,7 @@
 - 示例配置文件。
 - 包含 OpenAI 接口地址、API Key、Neo4j 连接、已访问 URL 文件路径、URL 历史 TTL、爬取深度、最大页面数等。
 - 可通过 `SKIP_HISTORY_SEEN_URLS` 控制是否跳过跨任务历史已处理 URL。
+- 可通过 `AUTO_BACKFILL_INDEXES_AFTER_CRAWL` 控制 URL 采集任务在写入实体/关系后是否自动触发索引补全任务。
 - 新环境部署时首先复制为 `.env`。
 
 #### `.gitignore`
@@ -191,7 +192,8 @@
 
 - 统一配置模型 `Settings`。
 - 负责把环境变量解析成强类型对象。
-- 包含 `APP_NAME`、`PROMPT_PROFILE` 等运行时配置入口。
+- 包含 `APP_NAME`、`KNOWLEDGE_THEME` 等运行时配置入口。
+- 包含 `AUTO_BACKFILL_INDEXES_AFTER_CRAWL`，用于控制 URL 采集任务完成后是否自动发起索引补全。
 - `allowed_domains` 支持逗号分隔字符串自动拆分。
 - `get_settings()` 用 `lru_cache` 做单例缓存。
 
@@ -378,6 +380,7 @@
   - 调用 LLM 做总结、抽取与关联链接排序
   - 按排序结果入队新发现链接
   - 调用图谱写入
+- 当 `AUTO_BACKFILL_INDEXES_AFTER_CRAWL=true` 且本次任务确实更新了实体/关系时，任务结束后自动发起全文和向量索引的 `backfill` 任务，只补全缺失或过期的数据
   - 合并多页图谱更新结果
 
 如果后续要加入：
@@ -401,9 +404,9 @@
 
 #### `app/services/llm/prompts.py`
 
-- 当前 GraphRAG 结构化抽取和链接评分的系统提示词与 prompt preset 定义。
-- 默认 `wuwa` preset 会保留历史鸣潮版 prompt 文本，`generic` preset 提供更中性的提示词。
-- 约束 LangChain structured output 的语义结构，包含页面摘要、实体关系和候选链接排序结果。
+- 当前 GraphRAG 结构化抽取和链接评分的统一系统提示词定义。
+- 支持通过 `KNOWLEDGE_THEME` 做页面级主题过滤；当页面与主题无关时，会直接跳过入库和信息抽取。
+- 约束 LangChain structured output 的语义结构，包含页面相关性、页面摘要、实体关系和候选链接排序结果。
 
 #### `app/services/llm/client.py`
 

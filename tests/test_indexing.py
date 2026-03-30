@@ -108,7 +108,8 @@ class _FakeGraphRepo:
         del scope
         return await self.get_index_statuses()
 
-    async def query_preview(self, query, *, entity_limit, source_limit, relation_limit):
+    async def query_preview(self, query, *, mode, entity_limit, source_limit, relation_limit):
+        del mode
         return {
             "query": query,
             "entities": [{"name": query, "fulltext_score": 1.0, "vector_score": 0.5, "hybrid_score": 1.5}],
@@ -194,6 +195,7 @@ def test_merge_entity_context_matches_prefers_hybrid_overlap():
                 "completeness_score": 2,
             }
         ],
+        fulltext_matches=[],
         vector_matches=[
             {
                 "entity_id": "role-alpha",
@@ -219,6 +221,52 @@ def test_merge_entity_context_matches_prefers_hybrid_overlap():
 
     assert merged[0]["entity_id"] == "role-alpha"
     assert merged[1]["entity_id"] == "region-beta"
+    assert round(merged[0]["hybrid_score"], 6) == round((1 / 61) + (1 / 61), 6)
+    assert round(merged[1]["hybrid_score"], 6) == round(1 / 62, 6)
+
+
+def test_merge_entity_context_matches_fulltext_mode_keeps_accumulated_score():
+    merged = _merge_entity_context_matches(
+        keyword_matches=[],
+        fulltext_matches=[
+            {
+                "entity_id": "siglia",
+                "name": "西格莉卡",
+                "fulltext_score": 1.2,
+                "hybrid_score": 1.2,
+            }
+        ],
+        vector_matches=[],
+        limit=5,
+        mode="fulltext",
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["entity_id"] == "siglia"
+    assert merged[0]["fulltext_score"] == 1.2
+    assert round(merged[0]["hybrid_score"], 6) == round(1 / 61, 6)
+
+
+def test_merge_entity_context_matches_keeps_keyword_only_results_as_hybrid_signal():
+    merged = _merge_entity_context_matches(
+        keyword_matches=[
+            {
+                "entity_id": "principal",
+                "name": "校长",
+                "summary": "只有关键词命中，没有全文或向量分数。",
+            }
+        ],
+        fulltext_matches=[],
+        vector_matches=[],
+        limit=5,
+        mode="hybrid",
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["entity_id"] == "principal"
+    assert merged[0].get("fulltext_score") is None
+    assert merged[0].get("vector_score") is None
+    assert round(merged[0]["hybrid_score"], 6) == round(1 / 61, 6)
 
 
 def test_merge_index_query_results_combines_fulltext_and_vector_scores():
@@ -229,7 +277,54 @@ def test_merge_index_query_results_combines_fulltext_and_vector_scores():
     )
 
     assert len(merged) == 1
-    assert (merged[0].hybrid_score or 0) > 1.0
+    assert merged[0].fulltext_score == 0.8
+    assert merged[0].vector_score == 0.5
+    assert round(merged[0].hybrid_score or 0.0, 6) == round((1 / 61) + (1 / 61), 6)
+
+
+def test_merge_index_query_results_does_not_double_count_single_fulltext_score():
+    merged = _merge_index_query_results(
+        [
+            IndexQueryResult(
+                source_type=EmbeddingSourceType.source,
+                source_key="source-1",
+                fulltext_score=4.7108,
+                hybrid_score=4.7108,
+            )
+        ],
+        [],
+        limit=5,
+        mode="hybrid",
+    )
+
+    assert len(merged) == 1
+    assert round(merged[0].hybrid_score or 0.0, 6) == round(1 / 61, 6)
+
+
+def test_merge_index_query_results_preserves_hybrid_score_after_vector_merge():
+    merged = _merge_index_query_results(
+        [
+            IndexQueryResult(
+                source_type=EmbeddingSourceType.relation,
+                source_key="entity-a::entity-b",
+                fulltext_score=1.6845,
+                hybrid_score=1.6845,
+            )
+        ],
+        [
+            IndexQueryResult(
+                source_type=EmbeddingSourceType.relation,
+                source_key="entity-a::entity-b",
+                vector_score=0.7221,
+                hybrid_score=0.7221,
+            )
+        ],
+        limit=5,
+        mode="hybrid",
+    )
+
+    assert len(merged) == 1
+    assert round(merged[0].hybrid_score or 0.0, 6) == round((1 / 61) + (1 / 61), 6)
 
 
 async def test_indexing_service_vector_backfill_runs_to_completion():

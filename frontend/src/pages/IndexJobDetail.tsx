@@ -87,7 +87,7 @@ export default function IndexJobDetail() {
       <div className="flex items-center justify-between shrink-0">
         <div className="space-y-1">
           <h1 className="text-2xl font-bold flex items-center gap-3">
-            {t('Index Job Detail')}
+            {t('index.job_detail')}
             <Badge variant={job.status === 'failed' ? 'destructive' : job.status === 'completed' ? 'default' : 'secondary'}>
               {job.status}
             </Badge>
@@ -98,14 +98,14 @@ export default function IndexJobDetail() {
           <p className="text-sm text-muted-foreground font-mono">{job.job_id}</p>
         </div>
         <Link to="/indexing">
-          <Button variant="outline">{t('Index Management')}</Button>
+          <Button variant="outline">{t('index.management')}</Button>
         </Link>
       </div>
 
       <div className="grid gap-6 md:grid-cols-4 shrink-0">
         <Card>
           <CardHeader className="py-4">
-            <CardTitle className="text-sm font-medium text-muted-foreground">{t('Index Type')}</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">{t('index.index_type')}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{job.index_type}</div>
@@ -113,7 +113,7 @@ export default function IndexJobDetail() {
         </Card>
         <Card>
           <CardHeader className="py-4">
-            <CardTitle className="text-sm font-medium text-muted-foreground">{t('Scanned')}</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">{t('index.scanned')}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{job.scanned_count}</div>
@@ -121,7 +121,7 @@ export default function IndexJobDetail() {
         </Card>
         <Card>
           <CardHeader className="py-4">
-            <CardTitle className="text-sm font-medium text-muted-foreground">{t('Synced')}</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">{t('index.synced')}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold text-green-600 dark:text-green-500">{job.synced_count}</div>
@@ -129,7 +129,7 @@ export default function IndexJobDetail() {
         </Card>
         <Card>
           <CardHeader className="py-4">
-            <CardTitle className="text-sm font-medium text-muted-foreground">{t('Failed')} / {t('Pending')}</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">{t('job.failed')} / {t('index.pending')}</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold text-red-600 dark:text-red-500">{job.failed_count} / {job.pending_count}</div>
@@ -139,7 +139,7 @@ export default function IndexJobDetail() {
 
       <Card className="flex-1 flex flex-col min-h-0">
         <CardHeader className="py-4 shrink-0">
-          <CardTitle className="text-base">{t('Logs')}</CardTitle>
+          <CardTitle className="text-base">{t('job.logs')}</CardTitle>
         </CardHeader>
         <CardContent className="flex-1 overflow-auto bg-muted/30 font-mono text-sm p-4 rounded-b-xl border-t">
           <div className="space-y-3">

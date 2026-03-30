@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.models import ExtractedEntity, GraphUpdateResult, PageExtraction
 from app.repos.graph_repo import Neo4jGraphRepository
 from app.services.llm.client import LLMClient
+from app.services.llm.pinyin import expand_aliases_with_pinyin
 
 MIN_MENTIONED_IN_SCORE = 0.05
 
@@ -44,7 +45,14 @@ def _prepare_entity_for_source_linking(entity: ExtractedEntity) -> ExtractedEnti
     score = _normalize_mentioned_in_score(entity.mentioned_in_score)
     if score is not None and score < MIN_MENTIONED_IN_SCORE:
         return None
-    return entity.model_copy(update={"mentioned_in_score": score})
+    normalized_aliases = expand_aliases_with_pinyin([entity.name, *entity.aliases])
+    aliases = [alias for alias in normalized_aliases if alias.casefold() != entity.name.casefold()]
+    return entity.model_copy(
+        update={
+            "mentioned_in_score": score,
+            "aliases": aliases,
+        }
+    )
 
 
 def _normalize_mentioned_in_score(score: float | None) -> float | None:

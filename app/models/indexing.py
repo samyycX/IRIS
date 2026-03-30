@@ -50,7 +50,6 @@ class IndexJobStage(str, Enum):
 class IndexJobRequest(BaseModel):
     index_type: IndexType
     scope: IndexScope = IndexScope.all
-    batch_size: int | None = Field(default=None, ge=1)
 
 
 class IndexPreparationRequest(BaseModel):
@@ -114,6 +113,7 @@ class IndexJobCreateResponse(BaseModel):
 
 class SearchPreviewRequest(BaseModel):
     query: str = Field(min_length=1)
+    mode: str = Field(default="hybrid")
     entity_limit: int = Field(default=5, ge=1, le=20)
     source_limit: int = Field(default=5, ge=1, le=20)
     relation_limit: int = Field(default=5, ge=1, le=20)

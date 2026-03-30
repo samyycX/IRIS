@@ -19,7 +19,6 @@ from app.services.graphrag.retriever import GraphRAGRetriever
 from app.services.llm.prompts import (
     build_page_extraction_prompt,
     build_related_url_filter_prompt,
-    get_prompt_bundle,
 )
 
 logger = get_logger(__name__)
@@ -32,7 +31,6 @@ class GraphRAGWorkflow:
     def __init__(self, settings: Settings, retriever: GraphRAGRetriever) -> None:
         self._settings = settings
         self._retriever = retriever
-        self._prompts = get_prompt_bundle(settings.prompt_profile)
         self.enabled = bool(settings.openai_api_key)
         self._llm = (
             ChatOpenAI(
@@ -61,6 +59,7 @@ class GraphRAGWorkflow:
             {
                 "canonical_url": canonical_url,
                 "title": title,
+                "knowledge_theme": self._normalized_knowledge_theme(),
                 "text": text,
                 "content_hash": content_hash,
                 "discovered_urls": discovered_urls,
@@ -69,10 +68,12 @@ class GraphRAGWorkflow:
             }
         )
         extraction = state["extraction"]
-        selected_urls = state.get("selected_urls", discovered_urls)
+        selected_urls = [] if not extraction.is_relevant else state.get("selected_urls", discovered_urls)
         return PageExtraction(
             canonical_url=canonical_url,
             title=title,
+            is_relevant=extraction.is_relevant,
+            irrelevant_reason=extraction.irrelevant_reason,
             summary=extraction.summary,
             extracted_entities=extraction.extracted_entities,
             discovered_urls=selected_urls,
@@ -85,10 +86,13 @@ class GraphRAGWorkflow:
             url=source_id,
             title=None,
             text=seed_text,
+            knowledge_theme="",
             context=GraphRAGContext(query=source_id),
         )
         return PageExtraction(
             canonical_url=source_id,
+            is_relevant=True,
+            irrelevant_reason=None,
             summary=extraction.summary,
             extracted_entities=extraction.extracted_entities,
             discovered_urls=[],
@@ -123,6 +127,7 @@ class GraphRAGWorkflow:
         extraction = await self._run_extraction_chain(
             url=state["canonical_url"],
             title=state.get("title"),
+            knowledge_theme=state.get("knowledge_theme", ""),
             text=state["text"],
             context=state["context"],
         )
@@ -137,8 +142,12 @@ class GraphRAGWorkflow:
             return {"selected_urls": discovered_urls}
         if not discovered_urls:
             return {"selected_urls": []}
+        extraction = state.get("extraction")
+        if extraction is not None and not extraction.is_relevant:
+            return {"selected_urls": []}
 
         payload = {
+            "knowledge_theme": state.get("knowledge_theme", ""),
             "source_url": state["canonical_url"],
             "title": state.get("title"),
             "text_excerpt": _truncate_text(state["text"], RELATED_URL_TEXT_LIMIT),
@@ -163,11 +172,13 @@ class GraphRAGWorkflow:
         *,
         url: str,
         title: str | None,
+        knowledge_theme: str,
         text: str,
         context: GraphRAGContext,
     ) -> GraphRAGExtractionPayload:
         chain = self._build_extraction_chain()
         payload = {
+            "knowledge_theme": knowledge_theme,
             "url": url,
             "title": title,
             "text": _truncate_text(text, PAGE_TEXT_LIMIT),
@@ -175,24 +186,29 @@ class GraphRAGWorkflow:
         }
         result = await chain.ainvoke(payload)
         return GraphRAGExtractionPayload(
-            summary=result.summary or (title or text[:200]),
+            is_relevant=result.is_relevant,
+            irrelevant_reason=result.irrelevant_reason,
+            summary=result.summary if not result.is_relevant else (result.summary or (title or text[:200])),
             extracted_entities=result.extracted_entities,
         )
 
     def _build_extraction_chain(self):
         llm = self._require_llm()
-        prompt = build_page_extraction_prompt(self._prompts)
+        prompt = build_page_extraction_prompt()
         return prompt | llm.with_structured_output(GraphRAGExtractionPayload)
 
     def _build_related_url_chain(self):
         llm = self._require_llm()
-        prompt = build_related_url_filter_prompt(self._prompts)
+        prompt = build_related_url_filter_prompt()
         return prompt | llm.with_structured_output(GraphRAGLinkSelectionPayload)
 
     def _require_llm(self) -> ChatOpenAI:
         if self._llm is None:
             raise RuntimeError("OPENAI_API_KEY is not configured")
         return self._llm
+
+    def _normalized_knowledge_theme(self) -> str:
+        return self._settings.knowledge_theme.strip()
 
 
 def _truncate_text(text: str, limit: int) -> str:

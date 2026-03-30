@@ -8,7 +8,7 @@ from app.core.config import Settings
 from app.models import ExtractedEntity
 from app.services.llm import EmbeddingClient
 from app.services.llm.client import LLMClient
-from app.services.llm.prompts import GENERIC_PAGE_EXTRACTION_PROMPT, PAGE_EXTRACTION_PROMPT
+from app.services.llm.prompts import DEFAULT_PROMPT_BUNDLE
 
 
 async def test_llm_client_raises_at_call_time_without_openai_api_key():
@@ -118,6 +118,7 @@ async def test_extract_knowledge_truncates_text_before_sending_to_llm():
     assert entities == []
     assert len(payload["text"]) == 50000
     assert payload["text"] == text[:50000]
+    assert payload["knowledge_theme"] == ""
 
 
 async def test_extract_knowledge_raises_on_invalid_json_response():
@@ -134,7 +135,7 @@ async def test_extract_knowledge_raises_on_invalid_json_response():
         )
 
 
-async def test_extract_knowledge_uses_wuwa_prompt_profile_by_default():
+async def test_extract_knowledge_uses_unified_prompt_and_includes_theme():
     client = LLMClient(Settings(openai_api_key="test-key"))
     completions = _FakeCompletions(['{"summary":"ok","extracted_entities":[]}'])
     client._client = _FakeOpenAIClient(completions)
@@ -144,24 +145,12 @@ async def test_extract_knowledge_uses_wuwa_prompt_profile_by_default():
         title="标题",
         text="正文",
         context=[],
+        knowledge_theme="鸣潮角色资料",
     )
 
-    assert completions.requests[0]["messages"][0]["content"] == PAGE_EXTRACTION_PROMPT.strip()
-
-
-async def test_extract_knowledge_can_switch_to_generic_prompt_profile():
-    client = LLMClient(Settings(openai_api_key="test-key", prompt_profile="generic"))
-    completions = _FakeCompletions(['{"summary":"ok","extracted_entities":[]}'])
-    client._client = _FakeOpenAIClient(completions)
-
-    await client.extract_knowledge(
-        url="https://example.com/page",
-        title="标题",
-        text="正文",
-        context=[],
-    )
-
-    assert completions.requests[0]["messages"][0]["content"] == GENERIC_PAGE_EXTRACTION_PROMPT.strip()
+    payload = json.loads(completions.requests[0]["messages"][1]["content"])
+    assert completions.requests[0]["messages"][0]["content"] == DEFAULT_PROMPT_BUNDLE.page_extraction.strip()
+    assert payload["knowledge_theme"] == "鸣潮角色资料"
 
 
 async def test_filter_related_urls_uses_context_and_preserves_llm_priority_order():

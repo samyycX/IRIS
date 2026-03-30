@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
 from sse_starlette import EventSourceResponse
 
 from app.models import (
+    AppConfig,
+    ConfigSummaryResponse,
+    DataSourceKind,
+    EmbeddingProfile,
     IndexJobRequest,
     IndexPreparationRequest,
     IndexScope,
     IndexStatusResponse,
     JobRequest,
     JobStatus,
+    LLMProfile,
+    Neo4jProfile,
     SearchPreviewRequest,
     SearchPreviewResponse,
 )
@@ -169,3 +177,135 @@ async def query_index_preview(
 ) -> SearchPreviewResponse:
     container = _container(request)
     return await container.indexing.query_preview(payload)
+
+
+@router.get("/config")
+async def get_config(request: Request) -> AppConfig:
+    container = _container(request)
+    return container.config_service.get_config()
+
+
+@router.put("/config")
+async def replace_config(request: Request, payload: AppConfig) -> AppConfig:
+    container = _container(request)
+    container.config_service.save_config(payload)
+    await container.reload_runtime()
+    return container.config_service.get_config()
+
+
+@router.get("/config/summary")
+async def get_config_summary(request: Request) -> ConfigSummaryResponse:
+    container = _container(request)
+    return ConfigSummaryResponse.model_validate(container.config_service.get_summary())
+
+
+@router.post("/config/reload")
+async def reload_config(request: Request) -> ConfigSummaryResponse:
+    container = _container(request)
+    await container.reload_runtime()
+    return ConfigSummaryResponse.model_validate(container.config_service.get_summary())
+
+
+@router.get("/config/data-sources")
+async def list_data_sources(request: Request) -> dict[str, Any]:
+    container = _container(request)
+    config = container.config_service.get_config()
+    return {
+        "active_neo4j_profile_id": config.active_neo4j_profile_id,
+        "active_llm_profile_id": config.active_llm_profile_id,
+        "active_embedding_profile_id": config.active_embedding_profile_id,
+        "neo4j_profiles": config.neo4j_profiles,
+        "llm_profiles": config.llm_profiles,
+        "embedding_profiles": config.embedding_profiles,
+    }
+
+
+@router.post("/config/data-sources/{kind}")
+async def create_data_source_profile(
+    request: Request,
+    kind: DataSourceKind,
+    payload: dict[str, Any],
+) -> AppConfig:
+    container = _container(request)
+    try:
+        profile = _parse_profile(kind, payload)
+        container.config_service.create_profile(kind, profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await container.reload_runtime()
+    return container.config_service.get_config()
+
+
+@router.put("/config/data-sources/{kind}/{profile_id}")
+async def update_data_source_profile(
+    request: Request,
+    kind: DataSourceKind,
+    profile_id: str,
+    payload: dict[str, Any],
+) -> AppConfig:
+    container = _container(request)
+    try:
+        profile = _parse_profile(kind, payload)
+        container.config_service.update_profile(kind, profile_id, profile)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Profile not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await container.reload_runtime()
+    return container.config_service.get_config()
+
+
+@router.delete("/config/data-sources/{kind}/{profile_id}")
+async def delete_data_source_profile(
+    request: Request,
+    kind: DataSourceKind,
+    profile_id: str,
+) -> AppConfig:
+    container = _container(request)
+    try:
+        container.config_service.delete_profile(kind, profile_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Profile not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await container.reload_runtime()
+    return container.config_service.get_config()
+
+
+@router.put("/config/data-sources/{kind}/active/{profile_id}")
+async def set_active_data_source_profile(
+    request: Request,
+    kind: DataSourceKind,
+    profile_id: str,
+) -> AppConfig:
+    container = _container(request)
+    try:
+        container.config_service.set_active_profile(kind, profile_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Profile not found") from exc
+    await container.reload_runtime()
+    return container.config_service.get_config()
+
+
+@router.delete("/config/data-sources/{kind}/active")
+async def clear_active_data_source_profile(
+    request: Request,
+    kind: DataSourceKind,
+) -> AppConfig:
+    container = _container(request)
+    container.config_service.set_active_profile(kind, None)
+    await container.reload_runtime()
+    return container.config_service.get_config()
+
+
+def _parse_profile(
+    kind: DataSourceKind,
+    payload: dict[str, Any],
+) -> Neo4jProfile | LLMProfile | EmbeddingProfile:
+    if kind == DataSourceKind.neo4j:
+        return Neo4jProfile.model_validate(payload)
+    if kind == DataSourceKind.llm:
+        return LLMProfile.model_validate(payload)
+    if kind == DataSourceKind.embedding:
+        return EmbeddingProfile.model_validate(payload)
+    raise ValueError(f"Unsupported data source kind: {kind}")

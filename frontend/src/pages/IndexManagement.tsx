@@ -8,7 +8,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -19,14 +18,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
 
 type Scope = 'all' | 'entity' | 'source' | 'relation'
 type IndexType = 'vector' | 'fulltext'
@@ -68,12 +59,6 @@ interface IndexStatusEntry {
   population_percent?: number | null
 }
 
-interface PreviewData {
-  entities: any[]
-  sources: any[]
-  relations: any[]
-}
-
 function IndexOperationCard({
   indexType,
   title,
@@ -92,7 +77,6 @@ function IndexOperationCard({
   const { t } = useTranslation()
   const navigate = useNavigate()
   const [scope, setScope] = useState<Scope>('all')
-  const [batchSize, setBatchSize] = useState('16')
   const [plan, setPlan] = useState<IndexPlan | null>(null)
   const [planMode, setPlanMode] = useState<Mode>('backfill')
   const [loading, setLoading] = useState(false)
@@ -139,7 +123,6 @@ function IndexOperationCard({
         body: JSON.stringify({
           index_type: indexType,
           scope,
-          batch_size: parseInt(batchSize, 10) || 16,
         }),
       })
       const data = await res.json()
@@ -200,33 +183,36 @@ function IndexOperationCard({
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-2">
-          <Label>{t('Scope')}</Label>
+          <Label>{t('index.scope')}</Label>
           <Select value={scope} onValueChange={(value) => setScope((value || 'all') as Scope)}>
             <SelectTrigger>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">{t('All')}</SelectItem>
-              <SelectItem value="entity">{t('Entity')}</SelectItem>
-              <SelectItem value="source">{t('Source')}</SelectItem>
-              <SelectItem value="relation">{t('Relation')}</SelectItem>
+              <SelectItem value="all">{t('common.all')}</SelectItem>
+              <SelectItem value="entity">{t('common.entity')}</SelectItem>
+              <SelectItem value="source">{t('common.source')}</SelectItem>
+              <SelectItem value="relation">{t('common.relation')}</SelectItem>
             </SelectContent>
           </Select>
         </div>
 
         {indexType === 'fulltext' && (
           <div className="space-y-3 rounded-lg border p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-sm font-medium">{t('Fulltext Index Status')}</div>
+            <div className="text-sm text-muted-foreground">
+              {t('index.fulltext_property_note')}
+            </div>
+            <div className="flex items-center justify-between gap-3 pt-2">
+              <div className="text-sm font-medium">{t('index.fulltext_status')}</div>
               <div className="flex gap-2">
                 <Button variant="outline" size="sm" onClick={onRefreshStatuses} disabled={loading}>
-                  {t('Check')}
+                  {t('index.check')}
                 </Button>
                 <Button variant="outline" size="sm" onClick={handleEnsureFulltext} disabled={loading}>
-                  {t('Build')}
+                  {t('index.build')}
                 </Button>
                 <Button variant="destructive" size="sm" onClick={handleRebuildFulltext} disabled={loading}>
-                  {t('Rebuild')}
+                  {t('index.rebuild')}
                 </Button>
               </div>
             </div>
@@ -236,7 +222,7 @@ function IndexOperationCard({
                   <span>{status.scope}</span>
                   <span className="flex items-center gap-2">
                     <Badge variant={status.exists ? 'default' : 'secondary'}>
-                      {status.exists ? status.state || 'online' : t('Missing')}
+                      {status.exists ? status.state || 'online' : t('index.missing')}
                     </Badge>
                     {status.population_percent != null && (
                       <span className="text-muted-foreground">
@@ -247,7 +233,7 @@ function IndexOperationCard({
                 </div>
               ))}
               {relevantStatuses.length === 0 && (
-                <div className="text-sm text-muted-foreground">{t('No status data')}</div>
+                <div className="text-sm text-muted-foreground">{t('index.no_status_data')}</div>
               )}
             </div>
           </div>
@@ -255,10 +241,10 @@ function IndexOperationCard({
 
         <div className="flex gap-3">
           <Button onClick={() => handlePrepare('backfill')} disabled={loading}>
-            {t('Prepare Backfill')}
+            {t('index.prepare_backfill')}
           </Button>
           <Button variant="destructive" onClick={() => handlePrepare('reindex')} disabled={loading}>
-            {t('Prepare Reindex')}
+            {t('index.prepare_reindex')}
           </Button>
         </div>
 
@@ -266,25 +252,14 @@ function IndexOperationCard({
           <div className="space-y-4 rounded-lg border p-4">
             <div className="space-y-1">
               <div className="text-sm font-medium">
-                {t('Prepared Candidates')}: {plan.total_count}
+                {t('index.prepared_candidates')}: {plan.total_count}
               </div>
               <div className="text-sm text-muted-foreground">
                 entity={plan.counts.entity || 0}, source={plan.counts.source || 0}, relation={plan.counts.relation || 0}
               </div>
             </div>
-
-            <div className="grid gap-2">
-              <Label>{t('Batch Size')}</Label>
-              <Input
-                type="number"
-                value={batchSize}
-                min="1"
-                onChange={(event) => setBatchSize(event.target.value)}
-              />
-            </div>
-
             <div className="space-y-2">
-              <div className="text-sm font-medium">{t('Candidate Samples')}</div>
+              <div className="text-sm font-medium">{t('index.candidate_samples')}</div>
               <div className="space-y-2">
                 {plan.candidates.map((candidate) => (
                   <div key={`${candidate.source_type}-${candidate.source_key}`} className="rounded border p-2 text-sm">
@@ -299,13 +274,13 @@ function IndexOperationCard({
                   </div>
                 ))}
                 {plan.candidates.length === 0 && (
-                  <div className="text-sm text-muted-foreground">{t('No candidates')}</div>
+                  <div className="text-sm text-muted-foreground">{t('index.no_candidates')}</div>
                 )}
               </div>
             </div>
 
             <Button onClick={handleRun} disabled={loading || plan.total_count === 0}>
-              {t('Confirm And Run')}
+              {t('index.confirm_and_run')}
             </Button>
           </div>
         )}
@@ -318,11 +293,6 @@ export default function IndexManagement() {
   const { t } = useTranslation()
   const [jobs, setJobs] = useState<IndexJobSummary[]>([])
   const [statuses, setStatuses] = useState<IndexStatusEntry[]>([])
-  const [query, setQuery] = useState('')
-  const [entityLimit, setEntityLimit] = useState('5')
-  const [sourceLimit, setSourceLimit] = useState('5')
-  const [relationLimit, setRelationLimit] = useState('5')
-  const [previewData, setPreviewData] = useState<PreviewData | null>(null)
 
   const loadJobs = async () => {
     try {
@@ -357,48 +327,23 @@ export default function IndexManagement() {
     return () => clearInterval(timer)
   }, [])
 
-  const handlePreview = async (event: React.FormEvent) => {
-    event.preventDefault()
-    try {
-      const res = await fetch('/api/indexing/query-preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query,
-          entity_limit: parseInt(entityLimit, 10) || 5,
-          source_limit: parseInt(sourceLimit, 10) || 5,
-          relation_limit: parseInt(relationLimit, 10) || 5,
-        }),
-      })
-      const data = await res.json()
-      if (res.ok) {
-        setPreviewData(data)
-      } else {
-        alert(data.detail || 'Failed to fetch preview')
-      }
-    } catch (err) {
-      console.error(err)
-      alert('Failed to fetch preview')
-    }
-  }
-
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">{t('Index Management')}</h1>
+      <h1 className="text-2xl font-bold">{t('index.management')}</h1>
 
       <div className="grid gap-6 lg:grid-cols-2">
         <IndexOperationCard
           indexType="vector"
-          title={t('Vector Index')}
-          description={t('Prepare and run embedding indexing jobs.')}
+          title={t('index.vector')}
+          description={t('index.vector_section_desc')}
           onJobCreated={loadJobs}
           fulltextStatuses={statuses}
           onRefreshStatuses={loadStatuses}
         />
         <IndexOperationCard
           indexType="fulltext"
-          title={t('Fulltext Index')}
-          description={t('Build, check, rebuild, and backfill searchable fulltext documents.')}
+          title={t('index.fulltext')}
+          description={t('index.fulltext_section_desc')}
           onJobCreated={loadJobs}
           fulltextStatuses={statuses}
           onRefreshStatuses={loadStatuses}
@@ -407,8 +352,8 @@ export default function IndexManagement() {
 
       <Card>
         <CardHeader>
-          <CardTitle>{t('Recent Index Jobs')}</CardTitle>
-          <CardDescription>{t('Jobs are kept in backend memory and disappear after service restart.')}</CardDescription>
+          <CardTitle>{t('index.recent_jobs')}</CardTitle>
+          <CardDescription>{t('index.jobs_volatile_note')}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           {jobs.slice(0, 8).map((job) => (
@@ -424,120 +369,26 @@ export default function IndexManagement() {
                   {job.status}
                 </Badge>
                 <Link to={`/indexing/jobs/${job.job_id}`} className="text-blue-500 hover:underline">
-                  {t('View Progress')}
+                  {t('index.view_progress')}
                 </Link>
               </div>
             </div>
           ))}
-          {jobs.length === 0 && <div className="text-sm text-muted-foreground">{t('No jobs')}</div>}
+          {jobs.length === 0 && <div className="text-sm text-muted-foreground">{t('index.no_jobs')}</div>}
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>{t('Query Preview')}</CardTitle>
-          <CardDescription>{t('Preview fulltext, vector, and hybrid scores together.')}</CardDescription>
+          <CardTitle>{t('index.query_preview')}</CardTitle>
+          <CardDescription>
+            {t('index.query_preview_moved')}
+          </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <form onSubmit={handlePreview} className="flex flex-col gap-4 max-w-md">
-            <div className="grid gap-2">
-              <Label>{t('Query')}</Label>
-              <Input value={query} onChange={(event) => setQuery(event.target.value)} required />
-            </div>
-            <div className="grid grid-cols-3 gap-4">
-              <div className="grid gap-2">
-                <Label>{t('Entity Limit')}</Label>
-                <Input type="number" value={entityLimit} onChange={(event) => setEntityLimit(event.target.value)} />
-              </div>
-              <div className="grid gap-2">
-                <Label>{t('Source Limit')}</Label>
-                <Input type="number" value={sourceLimit} onChange={(event) => setSourceLimit(event.target.value)} />
-              </div>
-              <div className="grid gap-2">
-                <Label>{t('Relation Limit')}</Label>
-                <Input type="number" value={relationLimit} onChange={(event) => setRelationLimit(event.target.value)} />
-              </div>
-            </div>
-            <Button type="submit">{t('Search')}</Button>
-          </form>
-
-          {previewData && (
-            <div className="space-y-6">
-              <div>
-                <h3 className="mb-2 text-lg font-semibold">{t('Entities')}</h3>
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{t('Entity')}</TableHead>
-                      <TableHead>{t('Fulltext Score')}</TableHead>
-                      <TableHead>{t('Vector Score')}</TableHead>
-                      <TableHead>{t('Hybrid Score')}</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {previewData.entities.map((entity, index) => (
-                      <TableRow key={index}>
-                        <TableCell>{entity.name}</TableCell>
-                        <TableCell>{entity.fulltext_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                        <TableCell>{entity.vector_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                        <TableCell>{entity.hybrid_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-
-              <div>
-                <h3 className="mb-2 text-lg font-semibold">{t('Sources')}</h3>
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{t('Title')}</TableHead>
-                      <TableHead>{t('Fulltext Score')}</TableHead>
-                      <TableHead>{t('Vector Score')}</TableHead>
-                      <TableHead>{t('Hybrid Score')}</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {previewData.sources.map((source, index) => (
-                      <TableRow key={index}>
-                        <TableCell>{source.title || source.source_key}</TableCell>
-                        <TableCell>{source.fulltext_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                        <TableCell>{source.vector_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                        <TableCell>{source.hybrid_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-
-              <div>
-                <h3 className="mb-2 text-lg font-semibold">{t('Relations')}</h3>
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{t('Left Entity')}</TableHead>
-                      <TableHead>{t('Right Entity')}</TableHead>
-                      <TableHead>{t('Fulltext Score')}</TableHead>
-                      <TableHead>{t('Vector Score')}</TableHead>
-                      <TableHead>{t('Hybrid Score')}</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {previewData.relations.map((relation, index) => (
-                      <TableRow key={index}>
-                        <TableCell>{relation.left_entity_name || relation.left_entity_id}</TableCell>
-                        <TableCell>{relation.right_entity_name || relation.right_entity_id}</TableCell>
-                        <TableCell>{relation.fulltext_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                        <TableCell>{relation.vector_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                        <TableCell>{relation.hybrid_score?.toFixed?.(4) ?? 'N/A'}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            </div>
-          )}
+        <CardContent>
+          <Link to="/search">
+            <Button>{t('index.go_to_search_preview')}</Button>
+          </Link>
         </CardContent>
       </Card>
     </div>

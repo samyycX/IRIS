@@ -25,6 +25,8 @@ class GraphRAGContext(BaseModel):
 
 
 class GraphRAGExtractionPayload(BaseModel):
+    is_relevant: bool = True
+    irrelevant_reason: str | None = None
     summary: str
     extracted_entities: list[ExtractedEntity] = Field(default_factory=list)
 
@@ -36,6 +38,7 @@ class GraphRAGLinkSelectionPayload(BaseModel):
 class GraphRAGWorkflowState(TypedDict, total=False):
     canonical_url: str
     title: str | None
+    knowledge_theme: str
     text: str
     content_hash: str
     discovered_urls: list[str]

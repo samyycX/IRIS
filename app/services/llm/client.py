@@ -11,8 +11,8 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models import ExtractedEntity
 from app.services.llm.prompts import (
+    DEFAULT_PROMPT_BUNDLE,
     build_entity_merge_prompt,
-    get_prompt_bundle,
 )
 
 logger = get_logger(__name__)
@@ -21,7 +21,6 @@ logger = get_logger(__name__)
 class LLMClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._prompts = get_prompt_bundle(settings.prompt_profile)
         self.enabled = bool(settings.openai_api_key)
         self._client = (
             AsyncOpenAI(
@@ -40,10 +39,12 @@ class LLMClient:
         title: str | None,
         text: str,
         context: list[dict[str, Any]],
+        knowledge_theme: str | None = None,
     ) -> tuple[str, list[ExtractedEntity]]:
         client = self._require_client()
         truncated_text = _truncate_for_llm(text, PAGE_EXTRACTION_TEXT_LIMIT)
         prompt = {
+            "knowledge_theme": (knowledge_theme or "").strip(),
             "url": url,
             "title": title,
             "context": context,
@@ -65,7 +66,10 @@ class LLMClient:
                 model=self._settings.openai_model,
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": self._prompts.page_extraction.strip()},
+                    {
+                        "role": "system",
+                        "content": DEFAULT_PROMPT_BUNDLE.page_extraction.strip(),
+                    },
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                 ],
             )
@@ -146,6 +150,7 @@ class LLMClient:
         context: list[dict[str, Any]],
         candidate_urls: list[str],
         candidate_url_entity_context: list[dict[str, Any]] | None = None,
+        knowledge_theme: str | None = None,
     ) -> list[str]:
         normalized_candidates = _normalize_candidate_urls(candidate_urls)
         if not normalized_candidates:
@@ -170,6 +175,7 @@ class LLMClient:
         for batch_index, batch in enumerate(batches, start=1):
             truncated_text = _truncate_for_llm(text, RELATED_URL_TEXT_LIMIT)
             prompt = {
+                "knowledge_theme": (knowledge_theme or "").strip(),
                 "source_url": source_url,
                 "title": title,
                 "context": context,
@@ -194,7 +200,10 @@ class LLMClient:
                     model=self._settings.openai_model,
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": self._prompts.related_url_filter.strip()},
+                        {
+                            "role": "system",
+                            "content": DEFAULT_PROMPT_BUNDLE.related_url_filter.strip(),
+                        },
                         {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                     ],
                 )
@@ -266,7 +275,7 @@ class LLMClient:
     def _build_merge_chain(self):
         from langchain_openai import ChatOpenAI
 
-        prompt = build_entity_merge_prompt(self._prompts)
+        prompt = build_entity_merge_prompt()
         llm = ChatOpenAI(
             model=self._settings.openai_model,
             api_key=self._settings.openai_api_key,

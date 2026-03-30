@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from app.core.config import Settings
 from app.models import (
     ExtractedEntity,
     GraphUpdateResult,
@@ -21,6 +22,9 @@ from app.repos.graph_repo import (
     _classify_entity_completeness,
     _build_search_terms,
     _entity_id,
+    _escape_fulltext_query,
+    _relation_types_are_similar,
+    _read_index_score,
     _select_canonical_match,
 )
 
@@ -138,6 +142,17 @@ def test_build_search_terms_covers_lookup_and_normalized_forms():
     assert "rolealpha" in terms
 
 
+def test_escape_fulltext_query_escapes_lucene_special_characters():
+    escaped = _escape_fulltext_query(' 鸣潮/典故: "设定" && || ')
+
+    assert escaped == '鸣潮\\/典故\\: \\"设定\\" \\&\\& \\|\\|'
+
+
+def test_relation_types_are_similar_for_long_near_duplicate_labels():
+    assert _relation_types_are_similar("地区乙组织核心成员", "地区乙组织的核心成员")
+    assert not _relation_types_are_similar("朋友", "女朋友")
+
+
 def test_related_url_lookup_terms_extracts_entity_slug_from_url():
     terms = _build_related_url_lookup_terms("https://wiki.example.com/character/%E8%A7%92%E8%89%B2%E7%94%B2")
 
@@ -154,6 +169,11 @@ def test_entity_completeness_score_marks_rich_entities_as_complete():
 
     assert score >= 7
     assert _classify_entity_completeness(score) == "complete"
+
+
+def test_read_index_score_accepts_fulltext_alias_or_score():
+    assert _read_index_score({"fulltext_score": 1.25}, "fulltext_score") == 1.25
+    assert _read_index_score({"score": 0.75}, "fulltext_score") == 0.75
 
 
 class _FakeTx:
@@ -182,6 +202,75 @@ class _FakeTxWithSingleResult(_FakeTx):
         return _FakeSingleResult(self._payload)
 
 
+class _FakeTxWithSequentialSingleResults(_FakeTx):
+    def __init__(self, payloads: list[dict]) -> None:
+        super().__init__()
+        self._payloads = list(payloads)
+
+    async def run(self, query: str, **kwargs):
+        self.calls.append((query, kwargs))
+        payload = self._payloads.pop(0) if self._payloads else {}
+        return _FakeSingleResult(payload)
+
+
+class _FakeRecord:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def data(self) -> dict:
+        return self._payload
+
+
+class _FakeResultStream:
+    def __init__(self, payloads: list[dict]) -> None:
+        self._payloads = payloads
+        self._index = 0
+
+    def __aiter__(self):
+        self._index = 0
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._payloads):
+            raise StopAsyncIteration
+        payload = self._payloads[self._index]
+        self._index += 1
+        return _FakeRecord(payload)
+
+
+class _FakeSession:
+    def __init__(self, payloads: list[dict]) -> None:
+        self._payloads = payloads
+        self.run_calls: list[tuple[str, dict | None, dict]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def run(self, query: str, parameters: dict | None = None, **kwargs):
+        self.run_calls.append((query, parameters, kwargs))
+        return _FakeResultStream(self._payloads)
+
+
+class _FakeDriver:
+    def __init__(self, session: _FakeSession) -> None:
+        self._session = session
+
+    def session(self):
+        return self._session
+
+
+class _FailingReadAdapter:
+    def __init__(self) -> None:
+        self.enabled = True
+
+    async def query(self, cypher: str, params: dict | None = None) -> list[dict]:
+        del cypher, params
+        raise RuntimeError("adapter boom")
+
+
 async def test_upsert_source_tx_writes_full_raw_text_excerpt_for_replacement():
     tx = _FakeTx()
     raw_text = "完整正文" * 600
@@ -201,6 +290,51 @@ async def test_upsert_source_tx_writes_full_raw_text_excerpt_for_replacement():
 
     assert "source.raw_text_excerpt = $raw_text_excerpt" in query
     assert params["raw_text_excerpt"] == raw_text
+
+
+async def test_query_read_records_passes_query_param_via_parameters_dict():
+    session = _FakeSession([{"value": "角色甲"}])
+    repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
+    repo._driver = _FakeDriver(session)
+    repo._read_adapter.enabled = False
+
+    rows = await repo._query_read_records("test_query", "RETURN $query AS value", query="角色甲")
+
+    assert rows == [{"value": "角色甲"}]
+    assert session.run_calls == [("RETURN $query AS value", {"query": "角色甲"}, {})]
+
+
+async def test_query_read_records_disables_read_adapter_after_failure():
+    session = _FakeSession([{"value": 1}])
+    repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
+    adapter = _FailingReadAdapter()
+    repo._read_adapter = adapter
+    repo._driver = _FakeDriver(session)
+
+    rows = await repo._query_read_records("test_query", "RETURN 1 AS value")
+
+    assert rows == [{"value": 1}]
+    assert adapter.enabled is False
+
+
+async def test_query_fulltext_sources_escapes_query_before_running_cypher():
+    session = _FakeSession([])
+    repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
+    repo._driver = _FakeDriver(session)
+    repo._read_adapter.enabled = False
+
+    rows = await repo.query_fulltext_sources("鸣潮/典故", limit=3)
+
+    assert rows == []
+    assert len(session.run_calls) == 1
+    query, parameters, kwargs = session.run_calls[0]
+    assert "db.index.fulltext.queryNodes" in query
+    assert parameters == {
+        "index_name": "source_fulltext_index",
+        "query": r"鸣潮\/典故",
+        "limit": 3,
+    }
+    assert kwargs == {}
 
 
 async def test_update_visited_relation_tx_stores_page_modification_details():
@@ -326,6 +460,94 @@ async def test_merge_entity_into_canonical_tx_keeps_higher_mentioned_in_relevanc
     assert "MERGE (canonical)-[merged:MENTIONED_IN]->(source)" in query
     assert "WHEN merged.relevance >= coalesce(rel.relevance, $default_relevance)" in query
     assert params["default_relevance"] == 0.5
+
+
+async def test_upsert_relation_tx_reuses_similar_existing_relation_instead_of_creating_new():
+    tx = _FakeTxWithSequentialSingleResults(
+        [
+            {"relation_types": ["地区乙组织的核心成员"]},
+            {"existed": True},
+        ]
+    )
+
+    created = await Neo4jGraphRepository._upsert_relation_tx(
+        tx,
+        source_entity_id="entity-1",
+        target_entity_id="entity-2",
+        relation_type="地区乙组织核心成员",
+        evidence="角色甲是地区乙组织核心成员。",
+    )
+
+    assert created is False
+    first_query, first_params = tx.calls[0]
+    second_query, second_params = tx.calls[1]
+    assert "collect(DISTINCT coalesce(rel.relation_type, \"RELATED_TO\")) AS relation_types" in first_query
+    assert first_params["source_entity_id"] == "entity-1"
+    assert first_params["target_entity_id"] == "entity-2"
+    assert "SET rel.evidence = CASE" in second_query
+    assert second_params["matched_relation_type"] == "地区乙组织的核心成员"
+
+
+async def test_mark_embedding_failed_tx_inserts_with_before_second_match():
+    tx = _FakeTx()
+
+    await Neo4jGraphRepository._mark_embedding_failed_tx(
+        tx,
+        source_type="relation",
+        source_key="entity-a::entity-b",
+        error="boom",
+    )
+
+    query, params = tx.calls[0]
+
+    assert "WITH $source_type AS source_type, $error AS error, $embedding_key AS embedding_key" in query
+    assert "OPTIONAL MATCH (embedding:Embedding {embedding_key: embedding_key})" in query
+    assert params["embedding_key"] == "relation:entity-a::entity-b"
+
+
+async def test_mark_fulltext_failed_tx_inserts_with_before_second_match():
+    tx = _FakeTx()
+
+    await Neo4jGraphRepository._mark_fulltext_failed_tx(
+        tx,
+        source_type="relation",
+        source_key="entity-a::entity-b",
+        error="boom",
+    )
+
+    query, _ = tx.calls[0]
+
+    assert "WITH $source_type AS source_type, $source_key AS source_key, $error AS error" in query
+    assert "OPTIONAL MATCH (embedding:RelationEmbedding {embedding_key: 'relation:' + source_key})" in query
+
+
+async def test_upsert_fulltext_documents_tx_avoids_subquery_importing_with():
+    tx = _FakeTx()
+
+    await Neo4jGraphRepository._upsert_fulltext_documents_tx(
+        tx,
+        records=[
+            {
+                "source_type": "entity",
+                "source_key": "entity-a",
+                "document_text": "doc",
+                "target_hash": "hash",
+                "updated_at": "2026-03-30T12:00:00+00:00",
+                "aggregated_text": "agg",
+                "left_entity_name": None,
+                "right_entity_name": None,
+            }
+        ],
+        version="v1",
+    )
+
+    query, params = tx.calls[0]
+
+    assert "CALL {" not in query
+    assert "FOREACH (_ IN CASE WHEN record.source_type = 'entity' AND entity IS NOT NULL THEN [1] ELSE [] END |" in query
+    assert "WITH record\n            OPTIONAL MATCH (source:Source {canonical_url: record.source_key})" in query
+    assert "FOREACH (_ IN CASE WHEN record.source_type = 'relation' THEN [1] ELSE [] END |" in query
+    assert params["version"] == "v1"
 
 
 def test_build_job_summary_text_includes_graph_update_and_error_details():

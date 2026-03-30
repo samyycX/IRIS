@@ -53,6 +53,8 @@ class ExtractedEntity(BaseModel):
 class PageExtraction(BaseModel):
     canonical_url: str
     title: str | None = None
+    is_relevant: bool = True
+    irrelevant_reason: str | None = None
     summary: str
     extracted_entities: list[ExtractedEntity] = Field(default_factory=list)
     discovered_urls: list[str] = Field(default_factory=list)

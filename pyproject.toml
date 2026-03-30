@@ -22,6 +22,7 @@ dependencies = [
   "playwright",
   "pydantic",
   "pydantic-settings",
+  "pypinyin",
   "python-multipart",
   "python-dotenv",
   "sse-starlette",

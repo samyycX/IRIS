@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
 
@@ -37,6 +38,7 @@ from app.services.llm.embedding_utils import (
     compute_embedding_content_hash,
     parse_relation_pair_key,
 )
+from app.services.llm.pinyin import expand_aliases_with_pinyin
 
 if TYPE_CHECKING:
     from app.services.llm.embedding_client import EmbeddingClient
@@ -50,6 +52,8 @@ ENTITY_FULLTEXT_INDEX_NAME = "entity_fulltext_index"
 SOURCE_FULLTEXT_INDEX_NAME = "source_fulltext_index"
 RELATION_FULLTEXT_INDEX_NAME = "relation_fulltext_index"
 DEFAULT_MENTIONED_IN_RELEVANCE = 0.5
+HYBRID_RRF_K = 60
+_LUCENE_SPECIAL_CHAR_PATTERN = re.compile(r'([+\-!(){}\[\]^"~*?:\\/&|])')
 
 
 class Neo4jGraphRepository:
@@ -127,47 +131,79 @@ class Neo4jGraphRepository:
         )
         return bool(records and records[0].get("is_recent"))
 
-    async def query_entity_context(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    async def query_entity_context(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        query_embedding: list[float] | None = None,
+        mode: str = "hybrid",
+    ) -> list[dict[str, Any]]:
         if not self.enabled or not query.strip():
             return []
-        fulltext_matches = await self.query_fulltext_entities(query, limit=limit)
-        keyword_matches = [
-            _enrich_entity_context_record(record)
-            for record in await self._query_read_records(
-                "query_entity_context",
-                _ENTITY_CONTEXT_CYPHER,
-                search_text=query,
-                limit=limit,
-            )
-        ]
-        keyword_matches = _merge_entity_context_matches(
-            keyword_matches,
-            [result.model_dump(mode="json") for result in fulltext_matches],
-            limit=limit,
-            vector_field="fulltext_score",
-        )
 
-        if not self._embedding_client or not self._embedding_client.enabled:
-            return keyword_matches
-
-        await self.connect()
-        async with self._driver.session() as session:
-            try:
-                query_embedding = await self._embedding_client.embed_text(query.strip())
-                vector_result = await session.run(
-                    _ENTITY_VECTOR_CONTEXT_CYPHER,
-                    index_name=ENTITY_EMBEDDING_INDEX_NAME,
-                    query_embedding=query_embedding,
+        keyword_matches: list[dict[str, Any]] = []
+        fulltext_matches: list[dict[str, Any]] = []
+        if mode in ("hybrid", "fulltext"):
+            fulltext_matches = [
+                result.model_dump(mode="json")
+                for result in await self.query_fulltext_entities(query, limit=limit)
+            ]
+            keyword_matches = [
+                _enrich_entity_context_record(record)
+                for record in await self._query_read_records(
+                    "query_entity_context",
+                    _ENTITY_CONTEXT_CYPHER,
+                    search_text=query,
                     limit=limit,
                 )
-                vector_matches = [
-                    _enrich_entity_context_record(record.data()) async for record in vector_result
-                ]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("entity_vector_query_failed", query=query, error=str(exc))
-                return keyword_matches
+            ]
 
-        return _merge_entity_context_matches(keyword_matches, vector_matches, limit=limit)
+        if mode == "fulltext":
+            return _merge_entity_context_matches(
+                keyword_matches=keyword_matches,
+                fulltext_matches=fulltext_matches,
+                vector_matches=[],
+                limit=limit,
+                mode="fulltext",
+            )
+
+        vector_matches: list[dict[str, Any]] = []
+        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled:
+            await self.connect()
+            async with self._driver.session() as session:
+                try:
+                    vector_input = query_embedding
+                    if vector_input is None:
+                        vector_input = await self._embedding_client.embed_text(query.strip())
+                    vector_result = await session.run(
+                        _ENTITY_VECTOR_CONTEXT_CYPHER,
+                        index_name=ENTITY_EMBEDDING_INDEX_NAME,
+                        query_embedding=vector_input,
+                        limit=limit,
+                    )
+                    vector_matches = [
+                        _enrich_entity_context_record(record.data()) async for record in vector_result
+                    ]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("entity_vector_query_failed", query=query, error=str(exc))
+
+        if mode == "vector":
+            return _merge_entity_context_matches(
+                keyword_matches=[],
+                fulltext_matches=[],
+                vector_matches=vector_matches,
+                limit=limit,
+                mode="vector",
+            )
+
+        return _merge_entity_context_matches(
+            keyword_matches=keyword_matches,
+            fulltext_matches=fulltext_matches,
+            vector_matches=vector_matches,
+            limit=limit,
+            mode="hybrid",
+        )
 
     async def query_related_url_entity_context(
         self,
@@ -243,10 +279,33 @@ class Neo4jGraphRepository:
         neighborhood_limit: int,
         neighborhood_hops: int = 2,
         candidate_urls: list[str] | None = None,
+        mode: str = "hybrid",
     ) -> dict[str, Any]:
-        entities = await self.query_entity_context(query, limit=entity_limit)
-        sources = await self.query_source_context(query, limit=source_limit)
-        relations = await self.query_relation_context(query, limit=relation_limit)
+        query_embedding: list[float] | None = None
+        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled and query.strip():
+            try:
+                query_embedding = await self._embedding_client.embed_text(query.strip())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("query_preview_embedding_failed", query=query, error=str(exc))
+
+        entities = await self.query_entity_context(
+            query,
+            limit=entity_limit,
+            query_embedding=query_embedding,
+            mode=mode,
+        )
+        sources = await self.query_source_context(
+            query,
+            limit=source_limit,
+            query_embedding=query_embedding,
+            mode=mode,
+        )
+        relations = await self.query_relation_context(
+            query,
+            limit=relation_limit,
+            query_embedding=query_embedding,
+            mode=mode,
+        )
         candidate_url_entity_context = await self.query_related_url_entity_context(
             candidate_urls or [],
             limit_per_url=2,
@@ -276,19 +335,28 @@ class Neo4jGraphRepository:
             "candidate_url_entity_context": candidate_url_entity_context,
         }
 
-    async def query_source_context(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+    async def query_source_context(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        query_embedding: list[float] | None = None,
+        mode: str = "hybrid",
+    ) -> list[IndexQueryResult]:
         if not self.enabled or not query.strip():
             return []
         vector_results: list[IndexQueryResult] = []
-        if self._embedding_client and self._embedding_client.enabled:
+        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled:
             try:
                 await self.connect()
-                query_embedding = await self._embedding_client.embed_text(query.strip())
+                vector_input = query_embedding
+                if vector_input is None:
+                    vector_input = await self._embedding_client.embed_text(query.strip())
                 async with self._driver.session() as session:
                     result = await session.run(
                         _SOURCE_VECTOR_QUERY_CYPHER,
                         index_name=SOURCE_EMBEDDING_INDEX_NAME,
-                        query_embedding=query_embedding,
+                        query_embedding=vector_input,
                         limit=limit,
                     )
                     vector_results = [
@@ -305,22 +373,40 @@ class Neo4jGraphRepository:
                     ]
             except Exception as exc:  # noqa: BLE001
                 logger.warning("source_vector_query_failed", query=query, error=str(exc))
-        fulltext_results = await self.query_fulltext_sources(query, limit=limit)
-        return _merge_index_query_results(fulltext_results, vector_results, limit=limit)
+        
+        fulltext_results: list[IndexQueryResult] = []
+        if mode in ("hybrid", "fulltext"):
+            fulltext_results = await self.query_fulltext_sources(query, limit=limit)
+        
+        return _merge_index_query_results(
+            fulltext_results,
+            vector_results,
+            limit=limit,
+            mode=mode,
+        )
 
-    async def query_relation_context(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
+    async def query_relation_context(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        query_embedding: list[float] | None = None,
+        mode: str = "hybrid",
+    ) -> list[IndexQueryResult]:
         if not self.enabled or not query.strip():
             return []
         vector_results: list[IndexQueryResult] = []
-        if self._embedding_client and self._embedding_client.enabled:
+        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled:
             try:
                 await self.connect()
-                query_embedding = await self._embedding_client.embed_text(query.strip())
+                vector_input = query_embedding
+                if vector_input is None:
+                    vector_input = await self._embedding_client.embed_text(query.strip())
                 async with self._driver.session() as session:
                     result = await session.run(
                         _RELATION_VECTOR_QUERY_CYPHER,
                         index_name=RELATION_EMBEDDING_INDEX_NAME,
-                        query_embedding=query_embedding,
+                        query_embedding=vector_input,
                         limit=limit,
                     )
                     vector_results = [
@@ -340,18 +426,30 @@ class Neo4jGraphRepository:
                     ]
             except Exception as exc:  # noqa: BLE001
                 logger.warning("relation_vector_query_failed", query=query, error=str(exc))
-        fulltext_results = await self.query_fulltext_relations(query, limit=limit)
-        return _merge_index_query_results(fulltext_results, vector_results, limit=limit)
+        
+        fulltext_results: list[IndexQueryResult] = []
+        if mode in ("hybrid", "fulltext"):
+            fulltext_results = await self.query_fulltext_relations(query, limit=limit)
+        
+        return _merge_index_query_results(
+            fulltext_results,
+            vector_results,
+            limit=limit,
+            mode=mode,
+        )
 
     async def query_fulltext_entities(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
         if not self.enabled or not query.strip():
+            return []
+        fulltext_query = _escape_fulltext_query(query)
+        if not fulltext_query:
             return []
         try:
             records = await self._query_read_records(
                 "query_fulltext_entities",
                 _ENTITY_FULLTEXT_QUERY_CYPHER,
                 index_name=ENTITY_FULLTEXT_INDEX_NAME,
-                query=query.strip(),
+                query=fulltext_query,
                 limit=limit,
             )
         except Exception as exc:  # noqa: BLE001
@@ -362,9 +460,9 @@ class Neo4jGraphRepository:
                 source_type=EmbeddingSourceType.entity,
                 source_key=str(record["entity_id"]),
                 entity_id=str(record["entity_id"]),
-                score=float(record["score"]),
-                fulltext_score=float(record["score"]),
-                hybrid_score=float(record["score"]),
+                score=_read_index_score(record, "fulltext_score"),
+                fulltext_score=_read_index_score(record, "fulltext_score"),
+                hybrid_score=_read_index_score(record, "fulltext_score"),
                 name=record.get("name"),
                 summary=record.get("summary"),
                 category=record.get("category"),
@@ -376,12 +474,15 @@ class Neo4jGraphRepository:
     async def query_fulltext_sources(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
         if not self.enabled or not query.strip():
             return []
+        fulltext_query = _escape_fulltext_query(query)
+        if not fulltext_query:
+            return []
         try:
             records = await self._query_read_records(
                 "query_fulltext_sources",
                 _SOURCE_FULLTEXT_QUERY_CYPHER,
                 index_name=SOURCE_FULLTEXT_INDEX_NAME,
-                query=query.strip(),
+                query=fulltext_query,
                 limit=limit,
             )
         except Exception as exc:  # noqa: BLE001
@@ -391,9 +492,9 @@ class Neo4jGraphRepository:
             IndexQueryResult(
                 source_type=EmbeddingSourceType.source,
                 source_key=str(record["source_key"]),
-                score=float(record["score"]),
-                fulltext_score=float(record["score"]),
-                hybrid_score=float(record["score"]),
+                score=_read_index_score(record, "fulltext_score"),
+                fulltext_score=_read_index_score(record, "fulltext_score"),
+                hybrid_score=_read_index_score(record, "fulltext_score"),
                 title=record.get("title"),
                 summary=record.get("summary"),
             )
@@ -403,12 +504,15 @@ class Neo4jGraphRepository:
     async def query_fulltext_relations(self, query: str, limit: int = 5) -> list[IndexQueryResult]:
         if not self.enabled or not query.strip():
             return []
+        fulltext_query = _escape_fulltext_query(query)
+        if not fulltext_query:
+            return []
         try:
             records = await self._query_read_records(
                 "query_fulltext_relations",
                 _RELATION_FULLTEXT_QUERY_CYPHER,
                 index_name=RELATION_FULLTEXT_INDEX_NAME,
-                query=query.strip(),
+                query=fulltext_query,
                 limit=limit,
             )
         except Exception as exc:  # noqa: BLE001
@@ -418,9 +522,9 @@ class Neo4jGraphRepository:
             IndexQueryResult(
                 source_type=EmbeddingSourceType.relation,
                 source_key=str(record["source_key"]),
-                score=float(record["score"]),
-                fulltext_score=float(record["score"]),
-                hybrid_score=float(record["score"]),
+                score=_read_index_score(record, "fulltext_score"),
+                fulltext_score=_read_index_score(record, "fulltext_score"),
+                hybrid_score=_read_index_score(record, "fulltext_score"),
                 left_entity_id=record.get("left_entity_id"),
                 right_entity_id=record.get("right_entity_id"),
                 left_entity_name=record.get("left_entity_name"),
@@ -940,6 +1044,7 @@ class Neo4jGraphRepository:
         self,
         query: str,
         *,
+        mode: str = "hybrid",
         entity_limit: int,
         source_limit: int,
         relation_limit: int,
@@ -952,6 +1057,7 @@ class Neo4jGraphRepository:
             neighborhood_limit=max(entity_limit, relation_limit),
             neighborhood_hops=2,
             candidate_urls=[],
+            mode=mode,
         )
 
     @staticmethod
@@ -1141,17 +1247,17 @@ class Neo4jGraphRepository:
 
         created_relationships = 0
         deleted_relationships = 0
-        deleted_relation_keys: set[tuple[str, str]] = set()
+        deleted_relation_types_by_target: dict[str, list[str]] = {}
         for relation in entity.deleted_relations:
             target_name = relation.get("target")
-            relation_type = relation.get("type", "RELATED_TO")
+            relation_type = _clean_relation_type(relation.get("type", "RELATED_TO"))
             if not target_name:
                 continue
             target_entity_id, _ = await Neo4jGraphRepository._resolve_relation_target_entity_tx(
                 tx,
                 target_name=target_name,
             )
-            deleted_relation_keys.add((str(relation_type).strip().casefold(), target_entity_id))
+            deleted_relation_types_by_target.setdefault(target_entity_id, []).append(relation_type)
             relation_deleted = await Neo4jGraphRepository._delete_relation_tx(
                 tx,
                 source_entity_id=canonical_entity_id,
@@ -1162,7 +1268,7 @@ class Neo4jGraphRepository:
 
         for relation in entity.relations:
             target_name = relation.get("target")
-            relation_type = relation.get("type", "RELATED_TO")
+            relation_type = _clean_relation_type(relation.get("type", "RELATED_TO"))
             evidence = relation.get("evidence")
             if not target_name:
                 continue
@@ -1170,8 +1276,11 @@ class Neo4jGraphRepository:
                 tx,
                 target_name=target_name,
             )
-            relation_key = (str(relation_type).strip().casefold(), target_entity_id)
-            if relation_key in deleted_relation_keys:
+            deleted_relation_types = deleted_relation_types_by_target.get(target_entity_id, [])
+            if any(
+                _relation_types_are_similar(relation_type, deleted_relation_type)
+                for deleted_relation_type in deleted_relation_types
+            ):
                 continue
             target_placeholder = ExtractedEntity(
                 name=target_name,
@@ -1413,6 +1522,31 @@ class Neo4jGraphRepository:
         relation_type: str,
         evidence: str | None,
     ) -> bool:
+        cleaned_relation_type = _clean_relation_type(relation_type)
+        matched_relation_type = await Neo4jGraphRepository._find_similar_relation_type_tx(
+            tx,
+            source_entity_id=source_entity_id,
+            target_entity_id=target_entity_id,
+            relation_type=cleaned_relation_type,
+        )
+        if matched_relation_type is not None:
+            await tx.run(
+                """
+                MATCH (:Entity {entity_id: $source_entity_id})-[rel:RELATED_TO {relation_type: $matched_relation_type}]->(:Entity {entity_id: $target_entity_id})
+                SET rel.evidence = CASE
+                    WHEN $evidence IS NULL OR trim($evidence) = '' THEN rel.evidence
+                    WHEN rel.evidence IS NULL OR trim(rel.evidence) = '' THEN $evidence
+                    WHEN size(trim($evidence)) > size(trim(rel.evidence)) THEN $evidence
+                    ELSE rel.evidence
+                END
+                RETURN count(rel) > 0 AS existed
+                """,
+                source_entity_id=source_entity_id,
+                target_entity_id=target_entity_id,
+                matched_relation_type=matched_relation_type,
+                evidence=evidence,
+            )
+            return False
         result = await tx.run(
             """
             MATCH (source:Entity {entity_id: $source_entity_id})
@@ -1425,11 +1559,36 @@ class Neo4jGraphRepository:
             """,
             source_entity_id=source_entity_id,
             target_entity_id=target_entity_id,
-            relation_type=relation_type,
+            relation_type=cleaned_relation_type,
             evidence=evidence,
         )
         record = await result.single()
         return not bool(record and record["existed"])
+
+    @staticmethod
+    async def _find_similar_relation_type_tx(
+        tx,
+        *,
+        source_entity_id: str,
+        target_entity_id: str,
+        relation_type: str,
+    ) -> str | None:
+        result = await tx.run(
+            """
+            MATCH (:Entity {entity_id: $source_entity_id})-[rel:RELATED_TO]->(:Entity {entity_id: $target_entity_id})
+            RETURN collect(DISTINCT coalesce(rel.relation_type, "RELATED_TO")) AS relation_types
+            """,
+            source_entity_id=source_entity_id,
+            target_entity_id=target_entity_id,
+        )
+        record = await result.single()
+        if record is None:
+            return None
+        for existing_relation_type in record.get("relation_types", []) or []:
+            candidate = _clean_relation_type(existing_relation_type)
+            if _relation_types_are_similar(candidate, relation_type):
+                return candidate
+        return None
 
     @staticmethod
     async def _delete_relation_tx(
@@ -1923,29 +2082,25 @@ class Neo4jGraphRepository:
         await tx.run(
             """
             UNWIND $records AS record
-            CALL {
-                WITH record
-                OPTIONAL MATCH (entity:Entity {entity_id: record.source_key})
-                WHERE record.source_type = 'entity'
+            OPTIONAL MATCH (entity:Entity {entity_id: record.source_key})
+            FOREACH (_ IN CASE WHEN record.source_type = 'entity' AND entity IS NOT NULL THEN [1] ELSE [] END |
                 SET entity.fulltext_text = record.document_text,
                     entity.fulltext_content_hash = record.target_hash,
                     entity.fulltext_version = $version,
                     entity.fulltext_last_synced_at = datetime(record.updated_at),
                     entity.fulltext_last_error = null
-                RETURN entity IS NOT NULL AS updated
-                UNION
-                WITH record
-                OPTIONAL MATCH (source:Source {canonical_url: record.source_key})
-                WHERE record.source_type = 'source'
+            )
+            WITH record
+            OPTIONAL MATCH (source:Source {canonical_url: record.source_key})
+            FOREACH (_ IN CASE WHEN record.source_type = 'source' AND source IS NOT NULL THEN [1] ELSE [] END |
                 SET source.fulltext_text = record.document_text,
                     source.fulltext_content_hash = record.target_hash,
                     source.fulltext_version = $version,
                     source.fulltext_last_synced_at = datetime(record.updated_at),
                     source.fulltext_last_error = null
-                RETURN source IS NOT NULL AS updated
-                UNION
-                WITH record
-                WHERE record.source_type = 'relation'
+            )
+            WITH record
+            FOREACH (_ IN CASE WHEN record.source_type = 'relation' THEN [1] ELSE [] END |
                 MERGE (embedding:Embedding {embedding_key: 'relation:' + record.source_key})
                 SET embedding.source_type = record.source_type,
                     embedding.source_key = record.source_key,
@@ -1960,8 +2115,7 @@ class Neo4jGraphRepository:
                     embedding.fulltext_last_synced_at = datetime(record.updated_at),
                     embedding.fulltext_last_error = null,
                     embedding:RelationEmbedding
-                RETURN true AS updated
-            }
+            )
             RETURN count(*) AS updated_count
             """,
             records=records,
@@ -1985,9 +2139,10 @@ class Neo4jGraphRepository:
                 SET node.embedding_last_error = $error,
                     node.embedding_last_dirty_at = coalesce(node.embedding_last_dirty_at, datetime())
             )
-            OPTIONAL MATCH (embedding:Embedding {embedding_key: $embedding_key})
-            FOREACH (_ IN CASE WHEN embedding IS NOT NULL AND $source_type = 'relation' THEN [1] ELSE [] END |
-                SET embedding.last_error = $error
+            WITH $source_type AS source_type, $error AS error, $embedding_key AS embedding_key
+            OPTIONAL MATCH (embedding:Embedding {embedding_key: embedding_key})
+            FOREACH (_ IN CASE WHEN embedding IS NOT NULL AND source_type = 'relation' THEN [1] ELSE [] END |
+                SET embedding.last_error = error
             )
             """,
             source_type=source_type,
@@ -2012,9 +2167,10 @@ class Neo4jGraphRepository:
             FOREACH (_ IN CASE WHEN node IS NOT NULL THEN [1] ELSE [] END |
                 SET node.fulltext_last_error = $error
             )
-            OPTIONAL MATCH (embedding:RelationEmbedding {embedding_key: 'relation:' + $source_key})
-            FOREACH (_ IN CASE WHEN embedding IS NOT NULL AND $source_type = 'relation' THEN [1] ELSE [] END |
-                SET embedding.fulltext_last_error = $error
+            WITH $source_type AS source_type, $source_key AS source_key, $error AS error
+            OPTIONAL MATCH (embedding:RelationEmbedding {embedding_key: 'relation:' + source_key})
+            FOREACH (_ IN CASE WHEN embedding IS NOT NULL AND source_type = 'relation' THEN [1] ELSE [] END |
+                SET embedding.fulltext_last_error = error
             )
             """,
             source_type=source_type,
@@ -2033,10 +2189,11 @@ class Neo4jGraphRepository:
                 return await self._read_adapter.query(cypher, params)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("langchain_graph_read_failed", query_name=query_name, error=str(exc))
+                self._read_adapter.enabled = False
 
         await self.connect()
         async with self._driver.session() as session:
-            result = await session.run(cypher, **params)
+            result = await session.run(cypher, parameters=params)
             return [record.data() async for record in result]
 
 
@@ -2107,16 +2264,22 @@ def _choose_summary(summaries: list[str | None]) -> str:
 def _merge_aliases(values: list[str]) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
-    for value in values:
+    for value in expand_aliases_with_pinyin(values):
         cleaned = " ".join(value.split()).strip()
         if not cleaned:
             continue
-        key = cleaned.casefold()
+        key = _normalize_alias_key(cleaned)
         if key in seen:
             continue
         seen.add(key)
         merged.append(cleaned)
     return merged
+
+
+def _normalize_alias_key(value: str) -> str:
+    cleaned = " ".join(value.split()).strip().casefold()
+    normalized = re.sub(r"[\W_]+", "", cleaned)
+    return normalized or cleaned
 
 
 def _build_relation_target_summary(
@@ -2133,6 +2296,44 @@ def _build_relation_target_summary(
     return f"在关系 {cleaned_relation} 中与 {cleaned_source} 有关联。"
 
 
+def _clean_relation_type(relation_type: str | None) -> str:
+    cleaned = " ".join(str(relation_type or "").split()).strip()
+    return cleaned or "RELATED_TO"
+
+
+def _normalize_relation_type(relation_type: str | None) -> str:
+    cleaned = _clean_relation_type(relation_type).casefold()
+    normalized = re.sub(r"[\W_]+", "", cleaned)
+    return normalized or "relatedto"
+
+
+def _relation_similarity_tokens(normalized_relation_type: str) -> set[str]:
+    if len(normalized_relation_type) < 2:
+        return {normalized_relation_type} if normalized_relation_type else set()
+    return {
+        normalized_relation_type[index : index + 2]
+        for index in range(len(normalized_relation_type) - 1)
+    }
+
+
+def _relation_types_are_similar(left: str | None, right: str | None) -> bool:
+    normalized_left = _normalize_relation_type(left)
+    normalized_right = _normalize_relation_type(right)
+    if normalized_left == normalized_right:
+        return True
+    if min(len(normalized_left), len(normalized_right)) < 6:
+        return False
+    surface_similarity = SequenceMatcher(None, normalized_left, normalized_right).ratio()
+    if surface_similarity >= 0.88:
+        return True
+    left_tokens = _relation_similarity_tokens(normalized_left)
+    right_tokens = _relation_similarity_tokens(normalized_right)
+    if not left_tokens or not right_tokens:
+        return False
+    token_overlap = len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
+    return surface_similarity >= 0.72 and token_overlap >= 0.8
+
+
 def _build_search_terms(name: str, aliases: list[str]) -> list[str]:
     terms: list[str] = []
     for value in [name, *aliases]:
@@ -2143,6 +2344,13 @@ def _build_search_terms(name: str, aliases: list[str]) -> list[str]:
         if normalized_name:
             terms.append(normalized_name)
     return sorted({term for term in terms if term})
+
+
+def _escape_fulltext_query(query: str) -> str:
+    cleaned = " ".join(query.split()).strip()
+    if not cleaned:
+        return ""
+    return _LUCENE_SPECIAL_CHAR_PATTERN.sub(r"\\\1", cleaned)
 
 
 def _normalize_lookup_term(value: str) -> str:
@@ -2453,35 +2661,80 @@ def _build_source_embedding_target_hash(*, summary: str, version: str) -> str:
 
 def _merge_entity_context_matches(
     keyword_matches: list[dict[str, Any]],
+    fulltext_matches: list[dict[str, Any]],
     vector_matches: list[dict[str, Any]],
     *,
     limit: int,
-    vector_field: str = "vector_score",
+    mode: str = "hybrid",
 ) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
+    keyword_ranks: dict[str, int] = {}
+    fulltext_ranks: dict[str, int] = {}
+    vector_ranks: dict[str, int] = {}
 
     for rank, match in enumerate(keyword_matches, start=1):
         entity_id = str(match.get("entity_id") or "")
         if not entity_id:
             continue
-        current = merged.get(entity_id, {**match, "hybrid_score": 0.0})
-        current["hybrid_score"] = float(current.get("hybrid_score") or 0.0) + (3.0 / rank)
-        merged[entity_id] = {**current, **match}
+        keyword_ranks.setdefault(entity_id, rank)
+        current = merged.get(entity_id, {"entity_id": entity_id})
+        merged[entity_id] = _merge_entity_match_fields(current, match)
+
+    for rank, match in enumerate(fulltext_matches, start=1):
+        entity_id = str(match.get("entity_id") or "")
+        if not entity_id:
+            continue
+        fulltext_ranks.setdefault(entity_id, rank)
+        current = merged.get(entity_id, {"entity_id": entity_id})
+        merged[entity_id] = _merge_entity_match_fields(current, match)
+        merged[entity_id]["fulltext_score"] = match.get("fulltext_score")
 
     for rank, match in enumerate(vector_matches, start=1):
         entity_id = str(match.get("entity_id") or "")
         if not entity_id:
             continue
-        current = merged.get(entity_id, {**match, "hybrid_score": 0.0})
-        vector_score = float(match.get(vector_field) or 0.0)
-        current["hybrid_score"] = float(current.get("hybrid_score") or 0.0) + vector_score + (1.0 / rank)
-        current[vector_field] = vector_score
-        merged[entity_id] = {**current, **match}
+        vector_ranks.setdefault(entity_id, rank)
+        current = merged.get(entity_id, {"entity_id": entity_id})
+        merged[entity_id] = _merge_entity_match_fields(current, match)
+        merged[entity_id]["vector_score"] = match.get("vector_score")
+
+    if mode == "vector":
+        candidates = {entity_id: item for entity_id, item in merged.items() if entity_id in vector_ranks}
+    elif mode == "fulltext":
+        candidates = {
+            entity_id: item
+            for entity_id, item in merged.items()
+            if entity_id in keyword_ranks or entity_id in fulltext_ranks
+        }
+    else:
+        candidates = merged
+
+    scored_results: list[dict[str, Any]] = []
+    for entity_id, item in candidates.items():
+        hybrid_score = _compute_rrf_score(
+            keyword_rank=keyword_ranks.get(entity_id),
+            fulltext_rank=fulltext_ranks.get(entity_id),
+            vector_rank=vector_ranks.get(entity_id),
+            include_keyword=mode != "vector",
+            include_fulltext=mode != "vector",
+            include_vector=mode != "fulltext",
+        )
+        if hybrid_score is None:
+            continue
+        payload = dict(item)
+        payload["hybrid_score"] = hybrid_score
+        scored_results.append(payload)
 
     return sorted(
-        merged.values(),
+        scored_results,
         key=lambda item: (
             float(item.get("hybrid_score") or 0.0),
+            int(str(item.get("entity_id") or "") in keyword_ranks),
+            _inverse_rank(keyword_ranks.get(str(item.get("entity_id") or ""))),
+            _inverse_rank(fulltext_ranks.get(str(item.get("entity_id") or ""))),
+            _inverse_rank(vector_ranks.get(str(item.get("entity_id") or ""))),
+            float(item.get("fulltext_score") or 0.0),
+            float(item.get("vector_score") or 0.0),
             int(item.get("completeness_score") or 0),
             int(item.get("relation_count") or 0),
             len(str(item.get("summary") or "")),
@@ -2495,27 +2748,56 @@ def _merge_index_query_results(
     vector_results: list[IndexQueryResult],
     *,
     limit: int,
+    mode: str = "hybrid",
 ) -> list[IndexQueryResult]:
     merged: dict[str, IndexQueryResult] = {}
+    fulltext_ranks: dict[str, int] = {}
+    vector_ranks: dict[str, int] = {}
     for rank, result in enumerate(fulltext_results, start=1):
-        current = merged.get(result.source_key, result.model_copy(deep=True))
-        current.hybrid_score = float(current.hybrid_score or 0.0) + float(result.fulltext_score or 0.0) + (
-            1.5 / rank
-        )
-        current.score = float(current.hybrid_score or 0.0)
+        fulltext_ranks.setdefault(result.source_key, rank)
+        current = merged.get(result.source_key)
+        if current is None:
+            current = result.model_copy(deep=True)
+            current.score = 0.0
+            current.vector_score = None
+            current.fulltext_score = None
+            current.hybrid_score = 0.0
+        current = _merge_index_query_result_fields(current, result)
+        current.fulltext_score = result.fulltext_score
         merged[result.source_key] = current
     for rank, result in enumerate(vector_results, start=1):
-        current = merged.get(result.source_key, result.model_copy(deep=True))
+        vector_ranks.setdefault(result.source_key, rank)
+        current = merged.get(result.source_key)
+        if current is None:
+            current = result.model_copy(deep=True)
+            current.score = 0.0
+            current.vector_score = None
+            current.fulltext_score = None
+            current.hybrid_score = 0.0
+        current = _merge_index_query_result_fields(current, result)
         current.vector_score = result.vector_score
-        current.hybrid_score = float(current.hybrid_score or 0.0) + float(result.vector_score or 0.0) + (
-            1.0 / rank
+        merged[result.source_key] = current
+
+    scored_results: list[IndexQueryResult] = []
+    for source_key, item in merged.items():
+        hybrid_score = _compute_rrf_score(
+            fulltext_rank=fulltext_ranks.get(source_key),
+            vector_rank=vector_ranks.get(source_key),
+            include_fulltext=mode != "vector",
+            include_vector=mode != "fulltext",
         )
-        current.score = float(current.hybrid_score or 0.0)
-        merged[result.source_key] = _merge_index_query_result_fields(current, result)
+        if hybrid_score is None:
+            continue
+        item.hybrid_score = hybrid_score
+        item.score = hybrid_score
+        scored_results.append(item)
+
     return sorted(
-        merged.values(),
+        scored_results,
         key=lambda item: (
             float(item.hybrid_score or 0.0),
+            _inverse_rank(fulltext_ranks.get(item.source_key)),
+            _inverse_rank(vector_ranks.get(item.source_key)),
             float(item.vector_score or 0.0),
             float(item.fulltext_score or 0.0),
             len(item.summary or item.aggregated_text or item.title or item.name or ""),
@@ -2530,10 +2812,59 @@ def _merge_index_query_result_fields(
 ) -> IndexQueryResult:
     payload = current.model_dump(mode="python")
     for field, value in incoming.model_dump(mode="python").items():
+        if field in {"score", "vector_score", "fulltext_score", "hybrid_score"}:
+            continue
         if value in (None, [], ""):
             continue
         payload[field] = value
     return IndexQueryResult.model_validate(payload)
+
+
+def _merge_entity_match_fields(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for field, value in incoming.items():
+        if field in {"score", "vector_score", "fulltext_score", "hybrid_score"}:
+            continue
+        if value in (None, [], ""):
+            continue
+        merged[field] = value
+    return merged
+
+
+def _compute_rrf_score(
+    *,
+    keyword_rank: int | None = None,
+    fulltext_rank: int | None = None,
+    vector_rank: int | None = None,
+    include_keyword: bool = False,
+    include_fulltext: bool = True,
+    include_vector: bool = True,
+) -> float | None:
+    total = 0.0
+    has_score = False
+    if include_keyword and keyword_rank is not None:
+        total += 1.0 / (HYBRID_RRF_K + keyword_rank)
+        has_score = True
+    if include_fulltext and fulltext_rank is not None:
+        total += 1.0 / (HYBRID_RRF_K + fulltext_rank)
+        has_score = True
+    if include_vector and vector_rank is not None:
+        total += 1.0 / (HYBRID_RRF_K + vector_rank)
+        has_score = True
+    return total if has_score else None
+
+
+def _inverse_rank(rank: int | None) -> float:
+    if rank is None:
+        return 0.0
+    return 1.0 / rank
+
+
+def _read_index_score(record: dict[str, Any], preferred_key: str) -> float:
+    value = record.get(preferred_key, record.get("score"))
+    if value is None:
+        raise KeyError(preferred_key)
+    return float(value)
 
 
 def _embedding_candidates_to_samples(candidates: list[EmbeddingCandidate]) -> list[IndexCandidateSample]:
@@ -2720,7 +3051,7 @@ RETURN node.source_key AS source_key,
        node.left_entity_id AS left_entity_id,
        node.right_entity_id AS right_entity_id,
        node.aggregated_text AS aggregated_text,
-       node.score AS stored_score,
+       node['score'] AS stored_score,
        node.embedding_updated_at AS embedding_updated_at,
        node.content_hash AS content_hash,
        score,
@@ -2760,7 +3091,7 @@ WHERE node:Source
 RETURN node.canonical_url AS source_key,
        node.title AS title,
        node.summary AS summary,
-       score
+       score AS fulltext_score
 ORDER BY score DESC
 LIMIT $limit
 """
@@ -2775,7 +3106,7 @@ RETURN node.source_key AS source_key,
        node.left_entity_name AS left_entity_name,
        node.right_entity_name AS right_entity_name,
        node.aggregated_text AS aggregated_text,
-       score
+       score AS fulltext_score
 ORDER BY score DESC
 LIMIT $limit
 """
@@ -2812,11 +3143,11 @@ RETURN entity.entity_id AS entity_id,
        entity.category AS category,
        entity.summary AS summary,
        coalesce(entity.aliases, []) AS aliases,
-       entity.embedding_target_hash AS embedding_target_hash,
-       entity.embedding_last_error AS embedding_last_error,
-       entity.embedding_content_hash AS embedding_content_hash,
-       entity.embedding_version AS embedding_version,
-       entity.embedding_model AS embedding_model,
+       entity['embedding_target_hash'] AS embedding_target_hash,
+       entity['embedding_last_error'] AS embedding_last_error,
+       entity['embedding_content_hash'] AS embedding_content_hash,
+       entity['embedding_version'] AS embedding_version,
+       entity['embedding_model'] AS embedding_model,
        [(entity)-[rel:RELATED_TO]->(target:Entity) |
            {
                type: coalesce(rel.relation_type, "RELATED_TO"),
@@ -2842,11 +3173,11 @@ MATCH (source:Source)
 WHERE NOT source.canonical_url IN $exclude_keys
 RETURN source.canonical_url AS canonical_url,
        source.summary AS summary,
-       source.embedding_target_hash AS embedding_target_hash,
-       source.embedding_last_error AS embedding_last_error,
-       source.embedding_content_hash AS embedding_content_hash,
-       source.embedding_version AS embedding_version,
-       source.embedding_model AS embedding_model
+       source['embedding_target_hash'] AS embedding_target_hash,
+       source['embedding_last_error'] AS embedding_last_error,
+       source['embedding_content_hash'] AS embedding_content_hash,
+       source['embedding_version'] AS embedding_version,
+       source['embedding_model'] AS embedding_model
 ORDER BY source.fetched_at DESC, source.canonical_url ASC
 SKIP $skip
 LIMIT $limit
@@ -2872,10 +3203,10 @@ RETURN left.entity_id AS left_entity_id,
        right.entity_id AS right_entity_id,
        right.name AS right_entity_name,
        relations,
-       embedding.content_hash AS embedding_content_hash,
-       embedding.embedding_version AS embedding_version,
-       embedding.embedding_model AS embedding_model,
-       embedding.last_error AS embedding_last_error
+       embedding['content_hash'] AS embedding_content_hash,
+       embedding['embedding_version'] AS embedding_version,
+       embedding['embedding_model'] AS embedding_model,
+       embedding['last_error'] AS embedding_last_error
 ORDER BY left.updated_at DESC, right.updated_at DESC, left.entity_id ASC, right.entity_id ASC
 SKIP $skip
 LIMIT $limit
@@ -2888,9 +3219,9 @@ RETURN entity.entity_id AS entity_id,
        entity.name AS name,
        entity.summary AS summary,
        coalesce(entity.aliases, []) AS aliases,
-       entity.fulltext_content_hash AS fulltext_content_hash,
-       entity.fulltext_version AS fulltext_version,
-       entity.fulltext_last_error AS fulltext_last_error
+       entity['fulltext_content_hash'] AS fulltext_content_hash,
+       entity['fulltext_version'] AS fulltext_version,
+       entity['fulltext_last_error'] AS fulltext_last_error
 ORDER BY entity.updated_at DESC, entity.name ASC
 SKIP $skip
 LIMIT $limit
@@ -2902,9 +3233,9 @@ WHERE NOT source.canonical_url IN $exclude_keys
 RETURN source.canonical_url AS canonical_url,
        source.title AS title,
        source.summary AS summary,
-       source.fulltext_content_hash AS fulltext_content_hash,
-       source.fulltext_version AS fulltext_version,
-       source.fulltext_last_error AS fulltext_last_error
+       source['fulltext_content_hash'] AS fulltext_content_hash,
+       source['fulltext_version'] AS fulltext_version,
+       source['fulltext_last_error'] AS fulltext_last_error
 ORDER BY source.fetched_at DESC, source.canonical_url ASC
 SKIP $skip
 LIMIT $limit
@@ -2927,9 +3258,9 @@ RETURN left.entity_id AS left_entity_id,
                ELSE text + " | " + item
            END
        ) AS aggregated_text,
-       embedding.fulltext_content_hash AS fulltext_content_hash,
-       embedding.fulltext_version AS fulltext_version,
-       embedding.fulltext_last_error AS fulltext_last_error
+       embedding['fulltext_content_hash'] AS fulltext_content_hash,
+       embedding['fulltext_version'] AS fulltext_version,
+       embedding['fulltext_last_error'] AS fulltext_last_error
 ORDER BY left.updated_at DESC, right.updated_at DESC, left.entity_id ASC, right.entity_id ASC
 SKIP $skip
 LIMIT $limit

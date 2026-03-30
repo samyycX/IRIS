@@ -4,10 +4,12 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from time import monotonic
+from typing import TYPE_CHECKING
 
 from app.core.logging import get_logger
 from app.models import (
     GraphUpdateResult,
+    IndexScope,
     JobCheckpoint,
     JobEvent,
     JobQueueItem,
@@ -24,6 +26,9 @@ from app.services.crawl.canonicalizer import URLCanonicalizer
 from app.services.llm.orchestrator import LlmOrchestrator
 from app.services.tools.executor import ToolExecutor
 
+if TYPE_CHECKING:
+    from app.services.indexing import IndexingService
+
 logger = get_logger(__name__)
 
 
@@ -36,9 +41,11 @@ class CrawlPipeline:
         canonicalizer: URLCanonicalizer,
         tool_executor: ToolExecutor,
         llm_orchestrator: LlmOrchestrator,
+        indexing_service: IndexingService | None = None,
         crawl_concurrency: int = 1,
         llm_timeout_seconds: int = 90,
         skip_history_seen_urls: bool = True,
+        auto_backfill_indexes_after_crawl: bool = False,
     ) -> None:
         self._event_store = event_store
         self._graph_repo = graph_repo
@@ -46,9 +53,11 @@ class CrawlPipeline:
         self._canonicalizer = canonicalizer
         self._tool_executor = tool_executor
         self._llm_orchestrator = llm_orchestrator
+        self._indexing_service = indexing_service
         self._crawl_concurrency = max(1, crawl_concurrency)
         self._llm_timeout_seconds = llm_timeout_seconds
         self._skip_history_seen_urls = skip_history_seen_urls
+        self._auto_backfill_indexes_after_crawl = auto_backfill_indexes_after_crawl
 
     async def run_job(
         self,
@@ -211,6 +220,10 @@ class CrawlPipeline:
             JobStatus.completed,
             graph_update=state.total_update,
         )
+        auto_index_backfill_summary = await self._maybe_trigger_auto_index_backfill(
+            job_id=job_id,
+            graph_update=state.total_update,
+        )
         await self._emit(
             job_id,
             JobStage.completed,
@@ -219,6 +232,7 @@ class CrawlPipeline:
                 **state.total_update.model_dump(),
                 "completion_reason": state.completion_reason,
                 "elapsed_ms": _elapsed_ms(started_at),
+                **auto_index_backfill_summary,
             },
         )
         return state.total_update
@@ -500,6 +514,8 @@ class CrawlPipeline:
                 summarizing_message,
                 url=extraction.canonical_url,
                 data={
+                    "is_relevant": extraction.is_relevant,
+                    "irrelevant_reason": extraction.irrelevant_reason,
                     "entity_count": len(extraction.extracted_entities),
                     "summary_length": len(extraction.summary),
                     "candidate_link_count": len(candidate_urls),
@@ -509,6 +525,19 @@ class CrawlPipeline:
                     "llm_elapsed_ms": _elapsed_ms(llm_started_at),
                 },
             )
+            if not extraction.is_relevant:
+                await self._emit(
+                    job_id,
+                    JobStage.summarizing,
+                    "页面与当前主题无关，跳过入库和后续扩展",
+                    url=extraction.canonical_url,
+                    data={
+                        "depth": depth,
+                        "is_relevant": False,
+                        "irrelevant_reason": extraction.irrelevant_reason,
+                    },
+                )
+                return
             graph_started_at = monotonic()
             await self._emit(
                 job_id,
@@ -685,6 +714,76 @@ class CrawlPipeline:
 
         return unseen_candidates, skipped_history_count
 
+    async def _maybe_trigger_auto_index_backfill(
+        self,
+        *,
+        job_id: str,
+        graph_update: GraphUpdateResult,
+    ) -> dict[str, object]:
+        if not self._auto_backfill_indexes_after_crawl:
+            return {"auto_index_backfill_enabled": False}
+        if self._indexing_service is None:
+            logger.warning("auto_index_backfill_skipped_missing_service", job_id=job_id)
+            return {
+                "auto_index_backfill_enabled": True,
+                "auto_index_backfill_triggered": False,
+                "auto_index_backfill_reason": "indexing_service_unavailable",
+            }
+        if not _graph_update_has_changes(graph_update):
+            return {
+                "auto_index_backfill_enabled": True,
+                "auto_index_backfill_triggered": False,
+                "auto_index_backfill_reason": "no_graph_changes",
+            }
+
+        await self._emit(
+            job_id,
+            JobStage.updating_graph,
+            "检测到图谱变更，开始自动触发索引补全任务",
+            data=graph_update.model_dump(),
+        )
+        try:
+            created, skipped = await self._indexing_service.create_graph_update_backfill_jobs(
+                scope=IndexScope.all
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("auto_index_backfill_trigger_failed", job_id=job_id, error=str(exc))
+            await self._emit(
+                job_id,
+                JobStage.updating_graph,
+                "自动触发索引补全失败，已跳过",
+                data={"error": str(exc)},
+            )
+            return {
+                "auto_index_backfill_enabled": True,
+                "auto_index_backfill_triggered": False,
+                "auto_index_backfill_reason": "trigger_failed",
+            }
+
+        created_jobs = [
+            {"index_type": index_type.value, "job_id": response.job_id, "status": response.status.value}
+            for index_type, response in created
+        ]
+        skipped_jobs = [
+            {"index_type": index_type.value, "reason": reason}
+            for index_type, reason in skipped
+        ]
+        await self._emit(
+            job_id,
+            JobStage.updating_graph,
+            "自动索引补全任务已处理",
+            data={
+                "created_jobs": created_jobs,
+                "skipped_jobs": skipped_jobs,
+            },
+        )
+        return {
+            "auto_index_backfill_enabled": True,
+            "auto_index_backfill_triggered": bool(created_jobs),
+            "auto_index_backfill_created_jobs": created_jobs,
+            "auto_index_backfill_skipped_jobs": skipped_jobs,
+        }
+
 
 def merge_graph_updates(left: GraphUpdateResult, right: GraphUpdateResult) -> GraphUpdateResult:
     return GraphUpdateResult(
@@ -698,6 +797,18 @@ def merge_graph_updates(left: GraphUpdateResult, right: GraphUpdateResult) -> Gr
 
 def _elapsed_ms(started_at: float) -> int:
     return int((monotonic() - started_at) * 1000)
+
+
+def _graph_update_has_changes(update: GraphUpdateResult) -> bool:
+    return any(
+        (
+            update.created_entities,
+            update.updated_entities,
+            update.created_sources,
+            update.created_relationships > 0,
+            update.deleted_relationships > 0,
+        )
+    )
 
 
 def _should_bypass_history_seen_check(*, url: str, depth: int, seed_url: str) -> bool:

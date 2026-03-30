@@ -4,6 +4,8 @@ import Home from './pages/Home'
 import JobDetail from './pages/JobDetail'
 import IndexManagement from './pages/IndexManagement'
 import IndexJobDetail from './pages/IndexJobDetail'
+import SearchPreview from './pages/SearchPreview'
+import Configuration from './pages/Configuration'
 import { Activity } from 'lucide-react'
 
 function App() {
@@ -18,11 +20,13 @@ function App() {
       <header className="border-b px-6 py-4 flex items-center justify-between">
         <Link to="/" className="flex items-center gap-2 font-semibold text-lg">
           <Activity className="w-5 h-5" />
-          {t('IRIS')}
+          {t('app.brand')}
         </Link>
         <div className="flex gap-4">
-          <Link to="/" className="text-sm hover:underline">{t('Home')}</Link>
-          <Link to="/indexing" className="text-sm hover:underline">{t('Index Management')}</Link>
+          <Link to="/" className="text-sm hover:underline">{t('nav.home')}</Link>
+          <Link to="/search" className="text-sm hover:underline">{t('nav.search_preview')}</Link>
+          <Link to="/indexing" className="text-sm hover:underline">{t('nav.index_management')}</Link>
+          <Link to="/config" className="text-sm hover:underline">{t('nav.configuration')}</Link>
           <button onClick={toggleLanguage} className="text-sm hover:underline">
             {i18n.language === 'zh' ? 'English' : '中文'}
           </button>
@@ -34,6 +38,8 @@ function App() {
           <Route path="/jobs/:jobId" element={<JobDetail />} />
           <Route path="/indexing" element={<IndexManagement />} />
           <Route path="/indexing/jobs/:jobId" element={<IndexJobDetail />} />
+          <Route path="/search" element={<SearchPreview />} />
+          <Route path="/config" element={<Configuration />} />
         </Routes>
       </main>
     </div>

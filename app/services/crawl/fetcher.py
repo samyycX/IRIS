@@ -3,19 +3,12 @@ from __future__ import annotations
 import contextlib
 import re
 
-import httpx
-
 from app.core.config import Settings
 
 
 class HttpFetcher:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client = httpx.AsyncClient(
-            headers={"User-Agent": settings.user_agent},
-            follow_redirects=True,
-            timeout=settings.request_timeout_seconds,
-        )
         self._playwright = None
         self._browser = None
 
@@ -26,21 +19,13 @@ class HttpFetcher:
             from playwright.async_api import async_playwright
         except ImportError as exc:  # pragma: no cover - depends on optional runtime package
             raise RuntimeError(
-                "ENABLE_PLAYWRIGHT=true 但未安装 Playwright。请先执行 `pip install playwright` "
+                "未安装 Playwright。请先执行 `pip install playwright` "
                 "并运行 `playwright install chromium`。"
             ) from exc
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self._settings.browser_headless
-        )
+        self._browser = await self._playwright.chromium.launch(headless=True)
         return self._browser
-
-    async def _fetch_with_http(self, url: str, referer: str | None = None) -> tuple[str, int, str, str]:
-        headers = {"Referer": referer} if referer else None
-        response = await self._client.get(url, headers=headers)
-        response.raise_for_status()
-        return str(response.url), response.status_code, response.text, "http"
 
     async def _auto_scroll(self, page) -> None:
         previous_height = -1
@@ -143,7 +128,6 @@ class HttpFetcher:
             await context.close()
 
     async def close(self) -> None:
-        await self._client.aclose()
         if self._browser is not None:
             await self._browser.close()
             self._browser = None
@@ -152,6 +136,4 @@ class HttpFetcher:
             self._playwright = None
 
     async def fetch(self, url: str, referer: str | None = None) -> tuple[str, int, str, str]:
-        if self._settings.enable_playwright:
-            return await self._fetch_with_browser(url, referer=referer)
-        return await self._fetch_with_http(url, referer=referer)
+        return await self._fetch_with_browser(url, referer=referer)

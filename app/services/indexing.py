@@ -98,6 +98,26 @@ class IndexingService:
         summary = await self._create_job(IndexJobMode.reindex, request)
         return IndexJobCreateResponse(job_id=summary.job_id, status=summary.status)
 
+    async def create_graph_update_backfill_jobs(
+        self,
+        scope: IndexScope = IndexScope.all,
+    ) -> tuple[list[tuple[IndexType, IndexJobCreateResponse]], list[tuple[IndexType, str]]]:
+        created: list[tuple[IndexType, IndexJobCreateResponse]] = []
+        skipped: list[tuple[IndexType, str]] = []
+        for index_type in (IndexType.fulltext, IndexType.vector):
+            if index_type == IndexType.vector and not self._embedding_client.enabled:
+                skipped.append((index_type, "Embedding client is not configured"))
+                continue
+            try:
+                response = await self.create_backfill_job(
+                    IndexJobRequest(index_type=index_type, scope=scope)
+                )
+            except HTTPException as exc:
+                skipped.append((index_type, str(exc.detail)))
+                continue
+            created.append((index_type, response))
+        return created, skipped
+
     async def get_statuses(self) -> IndexStatusResponse:
         return IndexStatusResponse(indexes=await self._graph_repo.get_index_statuses())
 
@@ -110,6 +130,7 @@ class IndexingService:
     async def query_preview(self, request: SearchPreviewRequest) -> SearchPreviewResponse:
         payload = await self._graph_repo.query_preview(
             request.query,
+            mode=request.mode,
             entity_limit=request.entity_limit,
             source_limit=request.source_limit,
             relation_limit=request.relation_limit,
@@ -124,7 +145,7 @@ class IndexingService:
         if request.index_type == IndexType.vector:
             self._ensure_embedding_enabled()
         await self._ensure_no_conflicting_job(request.index_type, request.scope)
-        batch_size = request.batch_size or self._settings.embedding_batch_size
+        batch_size = self._settings.embedding_batch_size
         summary = await self._job_store.create_job(
             index_type=request.index_type,
             mode=mode,

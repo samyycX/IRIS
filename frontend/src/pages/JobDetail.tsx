@@ -183,26 +183,26 @@ export default function JobDetail() {
         <Link to="/">
           <Badge variant="outline" className="px-3 py-1 cursor-pointer hover:bg-secondary">
             <ArrowLeft className="w-4 h-4 mr-2" />
-            {t('Back to Home')}
+            {t('nav.back_to_home')}
           </Badge>
         </Link>
-        <h1 className="text-2xl font-bold">{t('Job Detail')}</h1>
+        <h1 className="text-2xl font-bold">{t('job.detail')}</h1>
         {job.status === 'queued' || job.status === 'running' ? (
           <Button variant="outline" size="sm" onClick={handlePause}>
             <Pause className="w-4 h-4 mr-2" />
-            {t('Pause')}
+            {t('job.pause')}
           </Button>
         ) : null}
         {job.status !== 'completed' && job.status !== 'cancelled' ? (
           <Button variant="destructive" size="sm" onClick={handleCancel}>
             <Ban className="w-4 h-4 mr-2" />
-            {t('Cancel')}
+            {t('job.cancel')}
           </Button>
         ) : null}
         {job.resume_available && (job.status === 'interrupted' || job.status === 'failed' || job.status === 'paused') ? (
           <Button variant="outline" size="sm" onClick={handleResume}>
             <RotateCcw className="w-4 h-4 mr-2" />
-            {t('Resume')}
+            {t('job.resume')}
           </Button>
         ) : null}
       </div>
@@ -214,11 +214,11 @@ export default function JobDetail() {
           </CardHeader>
           <CardContent className="grid gap-4">
             <div>
-              <div className="text-sm font-medium text-muted-foreground">{t('Job ID')}</div>
+              <div className="text-sm font-medium text-muted-foreground">{t('job.id')}</div>
               <div className="font-mono text-sm break-all">{job.job_id}</div>
             </div>
             <div>
-              <div className="text-sm font-medium text-muted-foreground">{t('Status')}</div>
+              <div className="text-sm font-medium text-muted-foreground">{t('job.status')}</div>
               <div className="flex items-center gap-2 mt-1">
                 {getStatusIcon(job.status)}
                 <Badge variant="outline" className={`capitalize ${getStatusColor(job.status)}`}>
@@ -227,26 +227,26 @@ export default function JobDetail() {
               </div>
             </div>
             <div>
-              <div className="text-sm font-medium text-muted-foreground">{t('Type')}</div>
+              <div className="text-sm font-medium text-muted-foreground">{t('job.type')}</div>
               <div className="uppercase">{job.input_type}</div>
             </div>
             <div>
-              <div className="text-sm font-medium text-muted-foreground">{t('Seed')}</div>
+              <div className="text-sm font-medium text-muted-foreground">{t('job.seed')}</div>
               <div className="text-sm break-all">{job.seed}</div>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <div className="text-sm font-medium text-muted-foreground">{t('Visited')}</div>
+                <div className="text-sm font-medium text-muted-foreground">{t('job.visited')}</div>
                 <div className="text-2xl font-bold">{job.visited_count}</div>
               </div>
               <div>
-                <div className="text-sm font-medium text-muted-foreground">{t('Failed')}</div>
+                <div className="text-sm font-medium text-muted-foreground">{t('job.failed')}</div>
                 <div className="text-2xl font-bold">{job.failed_count}</div>
               </div>
             </div>
             {job.completion_reason ? (
               <div>
-                <div className="text-sm font-medium text-muted-foreground">{t('Completion Reason')}</div>
+                <div className="text-sm font-medium text-muted-foreground">{t('job.completion_reason')}</div>
                 <div className="text-sm">{job.completion_reason}</div>
               </div>
             ) : null}
@@ -255,7 +255,7 @@ export default function JobDetail() {
 
         <Card className="md:col-span-3 flex flex-col min-h-[500px] max-h-[800px]">
           <CardHeader>
-            <CardTitle>{t('Logs')}</CardTitle>
+            <CardTitle>{t('job.logs')}</CardTitle>
             <CardDescription>Live execution logs</CardDescription>
           </CardHeader>
           <CardContent className="flex-1 overflow-auto bg-black m-4 mt-0 rounded-md p-4 font-mono text-sm">

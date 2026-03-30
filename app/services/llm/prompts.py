@@ -11,10 +11,10 @@ class PromptBundle:
 
 
 PAGE_EXTRACTION_HUMAN_TEMPLATE = (
-    "URL: {url}\n标题: {title}\nGraphRAG上下文:\n{graph_context}\n\n正文:\n{text}"
+    "主题配置: {knowledge_theme}\nURL: {url}\n标题: {title}\nGraphRAG上下文:\n{graph_context}\n\n正文:\n{text}"
 )
 RELATED_URL_FILTER_HUMAN_TEMPLATE = (
-    "来源URL: {source_url}\n标题: {title}\nGraphRAG上下文:\n{graph_context}\n\n"
+    "主题配置: {knowledge_theme}\n来源URL: {source_url}\n标题: {title}\nGraphRAG上下文:\n{graph_context}\n\n"
     "正文摘录:\n{text_excerpt}\n\n候选URL:\n{candidate_urls}\n\n"
     "候选URL实体信号:\n{candidate_url_entity_context}"
 )
@@ -22,25 +22,29 @@ ENTITY_MERGE_HUMAN_TEMPLATE = "{payload}"
 
 
 PAGE_EXTRACTION_PROMPT = """
-你是一个用于构建《鸣潮》知识图谱的信息抽取系统。使用简体中文。
+你是一个用于构建知识图谱的信息抽取系统。使用简体中文。
 
 任务：
-1. 阅读给定网页正文和现有图谱上下文。
-2. 抽取适合进入知识图谱的实体，不要漏掉页面中明确出现且有图谱价值的对象。
-3. 为每个实体给出类别、别名列表，以及能直接写入知识图谱的详细事实说明。
-4. 为每个实体输出它与当前 Source 的 `mentioned_in_score`，范围是 0 到 1。
-5. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
-6. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
-7. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
-8. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
-9. 和鸣潮无关联的内容不要抽取。
+1. 先阅读给定网页正文、现有图谱上下文，以及调用方提供的“主题配置”。
+2. 如果“主题配置”非空，先判断当前页面是否和该主题明确相关；如果不相关，直接判定为不应入库。
+3. 只有在页面与主题相关，或者主题配置为空时，才继续抽取适合进入知识图谱的实体。
+4. 为每个实体给出类别、别名列表，以及能直接写入知识图谱的详细事实说明。
+5. 为每个实体输出它与当前 Source 的 `mentioned_in_score`，范围是 0 到 1。
+6. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
+7. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
+8. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
+9. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
 
 抽取原则：
 - 只记录文本中可以明确支持的信息，不要臆测。
+- `knowledge_theme` 可能为空字符串；为空时表示不做主题限制，只要页面有知识图谱价值即可抽取。
+- 如果 `knowledge_theme` 非空，必须先做主题相关性判断；页面只有蹭到边、关键词偶然出现、导航页里顺带提到、或明显属于别的主题时，都应判为不相关。
+- 如果页面与主题不相关，必须返回 `is_relevant=false`，给出简短 `irrelevant_reason`，并将 `summary` 置为空字符串、`extracted_entities` 置为空数组。
 - 同一实体如果页面里有多处描述，要整合成一条更完整的实体记录。
 - `summary` 字段虽然叫 summary，但这里必须写成“可直接入库的详细事实说明”，尽量覆盖身份、特点、能力、关系、时间、地点、数值等关键信息。
 - 如果上下文里已有同名或近义实体，应尽量沿用已有语义，避免把同一对象拆成多个实体。
 - `aliases` 只放真正的别名、称呼、简称、英文名、旧称，不要把普通描述句塞进去。
+- 如果 `name` 或 `aliases` 中出现中文名称，必须额外补充对应的无声调、全小写中文拼音别名；例如 `角色甲` 需要补出 `juesejia`。不要删除原中文写法。
 - `mentioned_in_score=1` 表示该 Source 基本就是在专门介绍这个实体；如果只是轻微带过，应给很低的分数。
 - 如果你判断某个实体与当前 Source 的关联度低于 `0.05`，直接不要输出这个实体。
 - `relations` 中每一项都要有明确目标对象，`type` 要具体稳定，`evidence` 要尽量摘录原文中的支持信息。
@@ -49,6 +53,8 @@ PAGE_EXTRACTION_PROMPT = """
 输出要求：
 - 仅返回 JSON。
 - JSON 必须包含：
+  - is_relevant: 布尔值，表示页面是否与主题相关、是否应进入知识图谱
+  - irrelevant_reason: 字符串；仅在 `is_relevant=false` 时填写，不相关原因要简短明确
   - summary: 字符串，表示页面级事实概览，尽量包含关键对象、事件和结论，不要写空泛摘要
   - extracted_entities: 数组
   - 每个实体包含：
@@ -63,20 +69,22 @@ PAGE_EXTRACTION_PROMPT = """
 
 
 RELATED_URL_FILTER_PROMPT = """
-你是一个用于《鸣潮》知识图谱构建的链接筛选与排序系统。使用简体中文。
+你是一个用于知识图谱构建的链接筛选与排序系统。使用简体中文。
 
 任务：
-1. 读取当前页面 URL、标题、正文摘录、现有图谱上下文、候选 URL 对应的图谱实体检索结果，以及一组候选关联 URL。
+1. 读取当前页面 URL、标题、正文摘录、现有图谱上下文、候选 URL 对应的图谱实体检索结果、调用方提供的主题配置，以及一组候选关联 URL。
 2. 只保留“值得继续抓取和建图”的 URL。
-3. 结合当前页面主题、正文事实、现有图谱上下文中的实体和关系，优先保留更可能补充关键事实的 URL。
-4. 输出的 `selected_urls` 必须按重要度从高到低排序，数组前面的 URL 会被优先抓取。
-5. 如果候选中出现 URL 编码后的地址，应按其原始含义理解。
-6. 输出必须严格从候选 URL 中选择，不要编造新 URL。
+3. 如果主题配置非空，优先保留明显仍属于该主题、且更可能补充主题事实的 URL。
+4. 结合当前页面主题、正文事实、现有图谱上下文中的实体和关系，优先保留更可能补充关键事实的 URL。
+5. 输出的 `selected_urls` 必须按重要度从高到低排序，数组前面的 URL 会被优先抓取。
+6. 如果候选中出现 URL 编码后的地址，应按其原始含义理解。
+7. 输出必须严格从候选 URL 中选择，不要编造新 URL。
 
 判定标准：
 - 优先保留：角色、组织、地点、剧情、任务、系统、玩法、物品、版本公告、机制说明、世界观设定、官方活动说明等包含明确事实内容的页面。
 - 优先保留：能补充当前页面核心实体、现有图谱缺失关系、或明显属于下一跳关键节点的详情页。
 - 优先保留：与当前页面标题、正文中反复出现的对象、以及图谱上下文中的实体直接相关的 URL。
+- 如果 `knowledge_theme` 非空，应排除明显与该主题无关的候选 URL，即使它们本身看起来是信息页。
 - 保留：如果 URL 中完全没有信息，并且大量同域名或者格式统一，保留，因为有可能这个站点的 URL 本就不包含信息，但是内容有可能包含信息。
 - 如果候选 URL 的对象在 `candidate_url_entity_context` 中已经能匹配到图谱内“记录很完善”的实体（例如 `completeness_level=complete`，且摘要、关系、被引用页面都较充分），应明显降低优先级；如果该 URL 看起来只是该实体的普通详情页、而不是版本更新/新公告/新事件/新增机制说明，可直接排除。
 - 如果候选 URL 虽然命中已有实体，但看起来更像“新版本公告、活动说明、机制更新、剧情新增、补丁变更”等可能带来新事实的页面，仍可保留，但排序应低于明显能补充缺失事实的页面。
@@ -103,6 +111,7 @@ ENTITY_MERGE_PROMPT = """
 - `summary` 不是简短摘要，而是这个实体当前应保存的完整事实说明，尽量按自然中文整理清楚。
 - 要合并身份、阵营、地区、别名、职责、能力、版本、数值、条件、限制、事件参与、时间地点等具体事实。
 - `aliases` 只保留真实别名或常见称呼，去重后输出。
+- 如果 `name` 或 `aliases` 中包含中文名称，最终 `aliases` 中必须保留对应的无声调、全小写中文拼音别名；不要删除原中文写法。
 - `relations` 需要整合旧关系和新关系；同一目标同一类型的关系只保留一条，优先保留证据更清楚的版本。
 - `deleted_relations` 用于表达这次应删除的旧关系；只有在新证据足以说明旧关系失效、错误或已不再成立时才输出。
 - 不要输出“可能”“推测”“疑似”这类未经证实的信息。
@@ -121,98 +130,17 @@ ENTITY_MERGE_PROMPT = """
 """
 
 
-GENERIC_PAGE_EXTRACTION_PROMPT = """
-你是一个用于构建知识图谱的信息抽取系统。使用简体中文。
-
-任务：
-1. 阅读给定网页正文和现有图谱上下文。
-2. 抽取适合进入知识图谱的实体，不要漏掉页面中明确出现且有图谱价值的对象。
-3. 为每个实体给出类别、别名列表，以及能直接写入知识图谱的详细事实说明。
-4. 为每个实体输出它与当前 Source 的 `mentioned_in_score`，范围是 0 到 1。
-5. 为每个实体补充明确、方向正确、尽量细粒度的实体关系。
-6. 如果页面明确表明某个旧关系已失效、被解除、被否定或不再成立，可以把该关系放进 `deleted_relations`。
-7. 如果页面包含数值、时间、地点、身份、阵营、职责、所属、称号、版本、条件、来源、限制等信息，需尽可能准确记录到对应实体中。
-8. 不要把页面内容压缩成空泛摘要，不要只写“这是某角色/某地点/某系统”，而要保留具体事实。
-9. 只抽取与当前页面主题和当前任务目标明确相关的内容。
-
-抽取原则：
-- 只记录文本中可以明确支持的信息，不要臆测。
-- 同一实体如果页面里有多处描述，要整合成一条更完整的实体记录。
-- `summary` 字段虽然叫 summary，但这里必须写成“可直接入库的详细事实说明”，尽量覆盖身份、特点、能力、关系、时间、地点、数值等关键信息。
-- 如果上下文里已有同名或近义实体，应尽量沿用已有语义，避免把同一对象拆成多个实体。
-- `aliases` 只放真正的别名、称呼、简称、英文名、旧称，不要把普通描述句塞进去。
-- `mentioned_in_score=1` 表示该 Source 基本就是在专门介绍这个实体；如果只是轻微带过，应给很低的分数。
-- 如果你判断某个实体与当前 Source 的关联度低于 `0.05`，直接不要输出这个实体。
-- `relations` 中每一项都要有明确目标对象，`type` 要具体稳定，`evidence` 要尽量摘录原文中的支持信息。
-- `deleted_relations` 只在页面有明确否定证据时输出，每项至少包含 `type` 和 `target`；如果同一关系同时出现在 `relations` 和 `deleted_relations`，以 `deleted_relations` 为准。
-
-输出要求：
-- 仅返回 JSON。
-- JSON 必须包含：
-  - summary: 字符串，表示页面级事实概览，尽量包含关键对象、事件和结论，不要写空泛摘要
-  - extracted_entities: 数组
-  - 每个实体包含：
-    - name: 字符串
-    - category: 字符串
-    - summary: 字符串，必须是详细事实说明，而不是一句空泛概述
-    - aliases: 字符串数组
-    - mentioned_in_score: 数字，范围 0 到 1，表示该实体和当前 Source 的关联度
-    - relations: 数组，每项包含 type、target、evidence
-    - deleted_relations: 数组，可选；每项至少包含 type、target，必要时可附带 reason 或 evidence
-"""
+DEFAULT_PROMPT_BUNDLE = PromptBundle(
+    page_extraction=PAGE_EXTRACTION_PROMPT,
+    related_url_filter=RELATED_URL_FILTER_PROMPT,
+    entity_merge=ENTITY_MERGE_PROMPT,
+)
 
 
-GENERIC_RELATED_URL_FILTER_PROMPT = """
-你是一个用于知识图谱构建的链接筛选与排序系统。使用简体中文。
-
-任务：
-1. 读取当前页面 URL、标题、正文摘录、现有图谱上下文、候选 URL 对应的图谱实体检索结果，以及一组候选关联 URL。
-2. 只保留“值得继续抓取和建图”的 URL。
-3. 结合当前页面主题、正文事实、现有图谱上下文中的实体和关系，优先保留更可能补充关键事实的 URL。
-4. 输出的 `selected_urls` 必须按重要度从高到低排序，数组前面的 URL 会被优先抓取。
-5. 如果候选中出现 URL 编码后的地址，应按其原始含义理解。
-6. 输出必须严格从候选 URL 中选择，不要编造新 URL。
-
-判定标准：
-- 优先保留：角色、组织、地点、剧情、任务、系统、玩法、物品、版本公告、机制说明、世界观设定、官方活动说明等包含明确事实内容的页面。
-- 优先保留：能补充当前页面核心实体、现有图谱缺失关系、或明显属于下一跳关键节点的详情页。
-- 优先保留：与当前页面标题、正文中反复出现的对象、以及图谱上下文中的实体直接相关的 URL。
-- 保留：如果 URL 中完全没有信息，并且大量同域名或者格式统一，保留，因为有可能这个站点的 URL 本就不包含信息，但是内容有可能包含信息。
-- 如果候选 URL 的对象在 `candidate_url_entity_context` 中已经能匹配到图谱内“记录很完善”的实体（例如 `completeness_level=complete`，且摘要、关系、被引用页面都较充分），应明显降低优先级；如果该 URL 看起来只是该实体的普通详情页、而不是版本更新/新公告/新事件/新增机制说明，可直接排除。
-- 如果候选 URL 虽然命中已有实体，但看起来更像“新版本公告、活动说明、机制更新、剧情新增、补丁变更”等可能带来新事实的页面，仍可保留，但排序应低于明显能补充缺失事实的页面。
-- 排除：登录、注册、标签/分类汇总页、隐私/条款、下载链接、图片/音频/视频/字体等静态资源页。
-
-输出要求：
-- 仅返回 JSON。
-- JSON 结构必须为：
-  - selected_urls: 字符串数组，元素必须来自候选 URL，且顺序表示抓取优先级
-"""
-
-
-DEFAULT_PROMPT_PROFILE = "wuwa"
-
-PROMPT_PRESETS = {
-    "wuwa": PromptBundle(
-        page_extraction=PAGE_EXTRACTION_PROMPT,
-        related_url_filter=RELATED_URL_FILTER_PROMPT,
-        entity_merge=ENTITY_MERGE_PROMPT,
-    ),
-    "generic": PromptBundle(
-        page_extraction=GENERIC_PAGE_EXTRACTION_PROMPT,
-        related_url_filter=GENERIC_RELATED_URL_FILTER_PROMPT,
-        entity_merge=ENTITY_MERGE_PROMPT,
-    ),
-}
-
-
-def get_prompt_bundle(profile: str | None) -> PromptBundle:
-    profile_key = (profile or DEFAULT_PROMPT_PROFILE).strip().casefold()
-    return PROMPT_PRESETS.get(profile_key, PROMPT_PRESETS[DEFAULT_PROMPT_PROFILE])
-
-
-def build_page_extraction_prompt(prompt_bundle: PromptBundle):
+def build_page_extraction_prompt(bundle: PromptBundle | None = None):
     from langchain_core.prompts import ChatPromptTemplate
 
+    prompt_bundle = bundle or DEFAULT_PROMPT_BUNDLE
     return ChatPromptTemplate.from_messages(
         [
             ("system", prompt_bundle.page_extraction.strip()),
@@ -221,9 +149,10 @@ def build_page_extraction_prompt(prompt_bundle: PromptBundle):
     )
 
 
-def build_related_url_filter_prompt(prompt_bundle: PromptBundle):
+def build_related_url_filter_prompt(bundle: PromptBundle | None = None):
     from langchain_core.prompts import ChatPromptTemplate
 
+    prompt_bundle = bundle or DEFAULT_PROMPT_BUNDLE
     return ChatPromptTemplate.from_messages(
         [
             ("system", prompt_bundle.related_url_filter.strip()),
@@ -232,9 +161,10 @@ def build_related_url_filter_prompt(prompt_bundle: PromptBundle):
     )
 
 
-def build_entity_merge_prompt(prompt_bundle: PromptBundle):
+def build_entity_merge_prompt(bundle: PromptBundle | None = None):
     from langchain_core.prompts import ChatPromptTemplate
 
+    prompt_bundle = bundle or DEFAULT_PROMPT_BUNDLE
     return ChatPromptTemplate.from_messages(
         [
             ("system", prompt_bundle.entity_merge.strip()),
