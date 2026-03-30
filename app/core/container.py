@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from neo4j.exceptions import AuthError, ConfigurationError, ServiceUnavailable
+
 from app.core.config import BootstrapSettings, Settings
+from app.core.logging import get_logger
 from app.repos import (
     InMemoryIndexJobStore,
     Neo4jGraphRepository,
@@ -30,6 +33,16 @@ from app.services.tools import (
     ToolExecutor,
     ToolRegistry,
     UpsertKgEntityTool,
+)
+
+logger = get_logger(__name__)
+
+_NEO4J_STARTUP_FAILURES = (
+    AuthError,
+    ServiceUnavailable,
+    ConfigurationError,
+    ConnectionError,
+    OSError,
 )
 
 
@@ -72,10 +85,27 @@ class ServiceContainer:
         runtime_settings = self.config_service.get_runtime_settings()
         self._build_runtime_components(runtime_settings)
         self._register_tools()
-        await self.graph_repo.ensure_constraints()
-        await self.migrations.run_migrations()
-        await self.jobs.mark_interrupted_jobs()
+        try:
+            await self.graph_repo.ensure_constraints()
+            await self.migrations.run_migrations()
+            await self.jobs.mark_interrupted_jobs()
+        except _NEO4J_STARTUP_FAILURES as exc:
+            await self._degrade_neo4j_after_startup_failure(exc)
         await self.indexing.initialize()
+
+    async def _degrade_neo4j_after_startup_failure(self, exc: BaseException) -> None:
+        logger.warning(
+            "neo4j_startup_unavailable",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            hint="Application continues without Neo4j; fix URI or credentials and reload configuration.",
+        )
+        if self.graph_repo is not None:
+            await self.graph_repo.mark_neo4j_unavailable()
+        if self.migrations is not None:
+            await self.migrations.mark_neo4j_unavailable()
+        if self.event_store is not None:
+            await self.event_store.mark_neo4j_unavailable()
 
     def _register_tools(self) -> None:
         self.tool_registry.register(FetchUrlTool(self.fetcher, self.extractor, self.discovery))

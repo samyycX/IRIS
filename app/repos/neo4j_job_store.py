@@ -63,6 +63,10 @@ class Neo4jJobStore(JobStore):
             await self._driver.close()
             self._driver = None
 
+    async def mark_neo4j_unavailable(self) -> None:
+        self._enabled = False
+        await self.close()
+
     async def create_job(self, request: JobRequest, max_depth: int, max_pages: int) -> JobSummary:
         job = JobSummary(
             job_id=str(uuid4()),

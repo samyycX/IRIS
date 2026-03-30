@@ -48,6 +48,10 @@ class Neo4jMigrationManager:
             await self._driver.close()
             self._driver = None
 
+    async def mark_neo4j_unavailable(self) -> None:
+        self.enabled = False
+        await self.close()
+
     async def ensure_constraints(self) -> None:
         if not self.enabled:
             return

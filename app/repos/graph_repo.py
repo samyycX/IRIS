@@ -28,7 +28,6 @@ from app.models import (
     TextIndexCandidate,
     utcnow,
 )
-from app.repos.langchain_graph import Neo4jGraphReadAdapter
 from app.services.llm.embedding_utils import (
     build_embedding_key,
     build_entity_embedding_text,
@@ -61,7 +60,6 @@ class Neo4jGraphRepository:
         self._settings = settings
         self._embedding_client = embedding_client
         self._driver = None
-        self._read_adapter = Neo4jGraphReadAdapter(settings)
         self.enabled = bool(
             settings.neo4j_uri and settings.neo4j_username and settings.neo4j_password
         )
@@ -78,7 +76,6 @@ class Neo4jGraphRepository:
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
-        await self._read_adapter.close()
 
     async def ensure_constraints(self) -> None:
         if not self.enabled:
@@ -105,6 +102,13 @@ class Neo4jGraphRepository:
         async with self._driver.session() as session:
             for statement in statements:
                 await session.run(statement)
+
+    async def mark_neo4j_unavailable(self) -> None:
+        """Turn off graph persistence after a failed connection or auth; closes drivers."""
+        self.enabled = False
+        if self._driver is not None:
+            await self._driver.close()
+            self._driver = None
 
     async def source_exists(self, canonical_url: str) -> bool:
         if not self.enabled:
@@ -2024,18 +2028,15 @@ class Neo4jGraphRepository:
         await tx.run(
             """
             UNWIND $records AS record
-            CALL {
-                WITH record
+            CALL (record) {
                 OPTIONAL MATCH (entity:Entity {entity_id: record.source_key})
                 WHERE record.source_type = 'entity'
                 RETURN entity AS node, null AS related_node, 'entity' AS resolved_type
                 UNION
-                WITH record
                 OPTIONAL MATCH (source:Source {canonical_url: record.source_key})
                 WHERE record.source_type = 'source'
                 RETURN source AS node, null AS related_node, 'source' AS resolved_type
                 UNION
-                WITH record
                 OPTIONAL MATCH (left:Entity {entity_id: record.left_entity_id})
                 OPTIONAL MATCH (right:Entity {entity_id: record.right_entity_id})
                 WHERE record.source_type = 'relation'
@@ -2184,13 +2185,6 @@ class Neo4jGraphRepository:
         cypher: str,
         **params: Any,
     ) -> list[dict[str, Any]]:
-        if self._read_adapter.enabled:
-            try:
-                return await self._read_adapter.query(cypher, params)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("langchain_graph_read_failed", query_name=query_name, error=str(exc))
-                self._read_adapter.enabled = False
-
         await self.connect()
         async with self._driver.session() as session:
             result = await session.run(cypher, parameters=params)
@@ -3143,11 +3137,11 @@ RETURN entity.entity_id AS entity_id,
        entity.category AS category,
        entity.summary AS summary,
        coalesce(entity.aliases, []) AS aliases,
-       entity['embedding_target_hash'] AS embedding_target_hash,
-       entity['embedding_last_error'] AS embedding_last_error,
-       entity['embedding_content_hash'] AS embedding_content_hash,
-       entity['embedding_version'] AS embedding_version,
-       entity['embedding_model'] AS embedding_model,
+       properties(entity)['embedding_target_hash'] AS embedding_target_hash,
+       properties(entity)['embedding_last_error'] AS embedding_last_error,
+       properties(entity)['embedding_content_hash'] AS embedding_content_hash,
+       properties(entity)['embedding_version'] AS embedding_version,
+       properties(entity)['embedding_model'] AS embedding_model,
        [(entity)-[rel:RELATED_TO]->(target:Entity) |
            {
                type: coalesce(rel.relation_type, "RELATED_TO"),
@@ -3173,11 +3167,11 @@ MATCH (source:Source)
 WHERE NOT source.canonical_url IN $exclude_keys
 RETURN source.canonical_url AS canonical_url,
        source.summary AS summary,
-       source['embedding_target_hash'] AS embedding_target_hash,
-       source['embedding_last_error'] AS embedding_last_error,
-       source['embedding_content_hash'] AS embedding_content_hash,
-       source['embedding_version'] AS embedding_version,
-       source['embedding_model'] AS embedding_model
+       properties(source)['embedding_target_hash'] AS embedding_target_hash,
+       properties(source)['embedding_last_error'] AS embedding_last_error,
+       properties(source)['embedding_content_hash'] AS embedding_content_hash,
+       properties(source)['embedding_version'] AS embedding_version,
+       properties(source)['embedding_model'] AS embedding_model
 ORDER BY source.fetched_at DESC, source.canonical_url ASC
 SKIP $skip
 LIMIT $limit
@@ -3219,9 +3213,9 @@ RETURN entity.entity_id AS entity_id,
        entity.name AS name,
        entity.summary AS summary,
        coalesce(entity.aliases, []) AS aliases,
-       entity['fulltext_content_hash'] AS fulltext_content_hash,
-       entity['fulltext_version'] AS fulltext_version,
-       entity['fulltext_last_error'] AS fulltext_last_error
+       properties(entity)['fulltext_content_hash'] AS fulltext_content_hash,
+       properties(entity)['fulltext_version'] AS fulltext_version,
+       properties(entity)['fulltext_last_error'] AS fulltext_last_error
 ORDER BY entity.updated_at DESC, entity.name ASC
 SKIP $skip
 LIMIT $limit
@@ -3233,9 +3227,9 @@ WHERE NOT source.canonical_url IN $exclude_keys
 RETURN source.canonical_url AS canonical_url,
        source.title AS title,
        source.summary AS summary,
-       source['fulltext_content_hash'] AS fulltext_content_hash,
-       source['fulltext_version'] AS fulltext_version,
-       source['fulltext_last_error'] AS fulltext_last_error
+       properties(source)['fulltext_content_hash'] AS fulltext_content_hash,
+       properties(source)['fulltext_version'] AS fulltext_version,
+       properties(source)['fulltext_last_error'] AS fulltext_last_error
 ORDER BY source.fetched_at DESC, source.canonical_url ASC
 SKIP $skip
 LIMIT $limit
@@ -3269,8 +3263,7 @@ LIMIT $limit
 _ENTITY_NEIGHBORHOOD_CYPHER = """
 UNWIND $entity_ids AS entity_id
 MATCH (seed:Entity {entity_id: entity_id})
-CALL {
-    WITH seed
+CALL (seed) {
     MATCH path = (seed)-[rels:RELATED_TO*1..2]-(neighbor:Entity)
     WHERE seed <> neighbor AND length(path) <= $hops
     WITH neighbor,

@@ -14,7 +14,6 @@ dependencies = [
   "httpx",
   "jinja2",
   "langchain",
-  "langchain-neo4j",
   "langchain-openai",
   "langgraph",
   "neo4j",

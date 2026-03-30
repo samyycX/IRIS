@@ -262,15 +262,6 @@ class _FakeDriver:
         return self._session
 
 
-class _FailingReadAdapter:
-    def __init__(self) -> None:
-        self.enabled = True
-
-    async def query(self, cypher: str, params: dict | None = None) -> list[dict]:
-        del cypher, params
-        raise RuntimeError("adapter boom")
-
-
 async def test_upsert_source_tx_writes_full_raw_text_excerpt_for_replacement():
     tx = _FakeTx()
     raw_text = "完整正文" * 600
@@ -296,7 +287,6 @@ async def test_query_read_records_passes_query_param_via_parameters_dict():
     session = _FakeSession([{"value": "角色甲"}])
     repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
     repo._driver = _FakeDriver(session)
-    repo._read_adapter.enabled = False
 
     rows = await repo._query_read_records("test_query", "RETURN $query AS value", query="角色甲")
 
@@ -304,24 +294,16 @@ async def test_query_read_records_passes_query_param_via_parameters_dict():
     assert session.run_calls == [("RETURN $query AS value", {"query": "角色甲"}, {})]
 
 
-async def test_query_read_records_disables_read_adapter_after_failure():
-    session = _FakeSession([{"value": 1}])
-    repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
-    adapter = _FailingReadAdapter()
-    repo._read_adapter = adapter
-    repo._driver = _FakeDriver(session)
-
-    rows = await repo._query_read_records("test_query", "RETURN 1 AS value")
-
-    assert rows == [{"value": 1}]
-    assert adapter.enabled is False
-
-
 async def test_query_fulltext_sources_escapes_query_before_running_cypher():
     session = _FakeSession([])
-    repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
+    repo = Neo4jGraphRepository(
+        Settings(
+            NEO4J_URI="neo4j://127.0.0.1:7687",
+            NEO4J_USERNAME="neo4j",
+            NEO4J_PASSWORD="pw",
+        )
+    )
     repo._driver = _FakeDriver(session)
-    repo._read_adapter.enabled = False
 
     rows = await repo.query_fulltext_sources("鸣潮/典故", limit=3)
 
