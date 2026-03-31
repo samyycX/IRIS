@@ -22,6 +22,7 @@ from app.models import (
     Neo4jProfile,
     SearchPreviewRequest,
     SearchPreviewResponse,
+    RuntimeStatusResponse
 )
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -60,6 +61,9 @@ async def logout(request: Request, response: Response) -> AuthStatusResponse:
         authenticated=False if not auth.bypass_enabled else True,
     )
 
+@router.get("/status", tags=["health"])
+async def status(request: Request) -> RuntimeStatusResponse:
+    return await request.app.state.container.runtime_status.get_status()
 
 @router.post("/jobs")
 async def create_job(request: Request, payload: JobRequest):

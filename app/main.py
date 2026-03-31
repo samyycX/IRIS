@@ -65,12 +65,6 @@ app.include_router(api_router)
 async def healthz():
     return {"status": "ok"}
 
-
-@app.get("/status", tags=["health"])
-async def status(request: Request) -> RuntimeStatusResponse:
-    return await request.app.state.container.runtime_status.get_status()
-
-
 # Serve static files from the React frontend build
 frontend_dist = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 

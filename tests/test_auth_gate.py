@@ -59,7 +59,7 @@ def _build_app(*, password: str = "", bypass_enabled: bool = False) -> FastAPI:
     )
     app.include_router(router)
 
-    @app.get("/status")
+    @app.get("/api/status")
     async def status(request: Request):
         return await request.app.state.container.runtime_status.get_status()
 
@@ -74,7 +74,7 @@ def test_auth_gate_rejects_protected_routes_until_login():
     client = TestClient(_build_app(password="secret"))
 
     assert client.get("/healthz").status_code == 200
-    assert client.get("/status").status_code == 401
+    assert client.get("/api/status").status_code == 401
     assert client.get("/api/auth/status").json() == {
         "bypass_enabled": False,
         "authenticated": False,
@@ -86,9 +86,9 @@ def test_auth_gate_login_unlocks_cookie_session():
 
     bad_login = client.post("/api/auth/login", json={"password": "wrong"})
     good_login = client.post("/api/auth/login", json={"password": "secret"})
-    protected = client.get("/status")
+    protected = client.get("/api/status")
     logout = client.post("/api/auth/logout")
-    locked_again = client.get("/status")
+    locked_again = client.get("/api/status")
 
     assert bad_login.status_code == 401
     assert good_login.status_code == 200
@@ -101,7 +101,7 @@ def test_auth_gate_bypass_allows_direct_access():
     client = TestClient(_build_app(bypass_enabled=True))
 
     status_response = client.get("/api/auth/status")
-    protected = client.get("/status")
+    protected = client.get("/api/status")
 
     assert status_response.status_code == 200
     assert status_response.json() == {

@@ -14,7 +14,7 @@
 - 通过接口更新配置后，后端会立即 reload 运行时依赖。
 - 如果更新后的激活 Neo4j 配置完整，reload 过程中会执行 Neo4j migration。
 - 每次 reload 完成后，后端会立即重测 Neo4j、LLM、Embedding 的运行状态，并刷新状态快照。
-- 后端不会后台轮询这些依赖；状态只会在初始化、调用 `/status`、以及配置 reload 时更新。
+- 后端不会后台轮询这些依赖；状态只会在初始化、调用 `/api/status`、以及配置 reload 时更新。
 - Prompt 使用后端内置默认值，当前不提供自定义接口。
 - 当前前端最核心需要配置的文本项是 `runtime.knowledge_theme`。
 - Playwright 和无头浏览器默认开启，不再作为可配置项暴露。
@@ -172,7 +172,7 @@
 
 ### 11. 读取运行时状态
 
-- 方法：`GET /status`
+- 方法：`GET /api/status`
 - 用途：返回当前 Neo4j、LLM、Embedding 的健康状态，以及当前图谱中的 Entity、Source、RELATED_TO 计数。
 - 行为：每次请求都会即时刷新一次状态快照；当 Neo4j 当前不可用但此前拿到过统计时，会保留最近一次成功统计并标记 `graph.stale=true`。
 

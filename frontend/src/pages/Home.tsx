@@ -39,7 +39,7 @@ export default function Home() {
 
   const loadStatus = async () => {
     try {
-      const res = await apiFetch('/status')
+      const res = await apiFetch('/api/status')
       if (res.ok) {
         const data = await res.json()
         setStatus(data)
