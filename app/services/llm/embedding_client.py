@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any
+
+from openai import AsyncOpenAI
 
 from app.core.config import Settings
 from app.core.logging import get_logger
@@ -13,6 +16,14 @@ class EmbeddingClient:
         self._settings = settings
         self.enabled = bool(settings.openai_embedding_api_key)
         self._client = self._build_client() if self.enabled else None
+        self._health_client = (
+            AsyncOpenAI(
+                api_key=settings.openai_embedding_api_key,
+                base_url=settings.openai_embedding_base_url,
+            )
+            if self.enabled
+            else None
+        )
 
     async def embed_text(self, text: str) -> list[float]:
         embeddings = await self.embed_texts([text])
@@ -40,6 +51,28 @@ class EmbeddingClient:
         )
         return vectors
 
+    async def check_health(self) -> tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        client = self._require_health_client()
+        try:
+            await client.models.list()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    async def close(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            async_client = getattr(client, "async_client", None)
+            if async_client is not None:
+                await _close_async_resource(async_client)
+        health_client = self._health_client
+        self._health_client = None
+        if health_client is not None:
+            await _close_async_resource(health_client)
+
     def _build_client(self):
         from langchain_openai import OpenAIEmbeddings
 
@@ -56,3 +89,19 @@ class EmbeddingClient:
         if self._client is None:
             raise RuntimeError("Embedding client is not configured.")
         return self._client
+
+    def _require_health_client(self) -> AsyncOpenAI:
+        if self._health_client is None:
+            raise RuntimeError("Embedding client is not configured.")
+        return self._health_client
+
+
+async def _close_async_resource(resource: Any) -> None:
+    for method_name in ("close", "aclose"):
+        method = getattr(resource, method_name, None)
+        if not callable(method):
+            continue
+        result = method()
+        if inspect.isawaitable(result):
+            await result
+        return

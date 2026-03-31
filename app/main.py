@@ -4,11 +4,12 @@ import asyncio
 import sys
 import os
 from contextlib import asynccontextmanager
+from typing import Callable
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -16,6 +17,21 @@ from app.api.routes import router as api_router
 from app.core.config import get_settings
 from app.core.container import ServiceContainer
 from app.core.logging import configure_logging
+from app.models import RuntimeStatusResponse
+
+
+_AUTH_EXEMPT_PATHS = {
+    "/healthz",
+    "/api/auth/status",
+    "/api/auth/login",
+    "/api/auth/logout",
+}
+
+
+def _requires_auth(path: str) -> bool:
+    if path in _AUTH_EXEMPT_PATHS:
+        return False
+    return path == "/status" or path.startswith("/api/")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,12 +47,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="I.R.I.S.", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_password_gate(request: Request, call_next: Callable):
+    if _requires_auth(request.url.path):
+        auth = request.app.state.container.auth
+        if not auth.is_request_authenticated(request):
+            return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+    return await call_next(request)
+
+
 app.include_router(api_router)
 
 
 @app.get("/healthz", tags=["health"])
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/status", tags=["health"])
+async def status(request: Request) -> RuntimeStatusResponse:
+    return await request.app.state.container.runtime_status.get_status()
 
 
 # Serve static files from the React frontend build

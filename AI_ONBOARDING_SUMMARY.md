@@ -27,6 +27,7 @@
 - 后台任务：进程内异步任务
 - 日志：`structlog`
 - 前端实时刷新：`SSE`
+- 前端访问门禁：启动时要求 `IRIS_PASSWORD` 或 `IRIS_PASSWORD_BYPASS=1`，API 与状态接口受同源 Cookie 鉴权保护
 
 ---
 

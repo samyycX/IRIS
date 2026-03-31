@@ -1,6 +1,8 @@
 import asyncio
 
+import pytest
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.api.routes import router
@@ -21,6 +23,7 @@ from app.models import (
     TextIndexCandidate,
 )
 from app.repos.graph_repo import _merge_entity_context_matches, _merge_index_query_results
+from app.repos.graph_repo import Neo4jUnavailableError
 from app.repos.index_job_store import InMemoryIndexJobStore
 from app.services.indexing import IndexingService
 from app.services.llm.embedding_utils import (
@@ -46,6 +49,18 @@ class _FakeEmbeddingClient:
         return [1.0, 0.5]
 
 
+class _BlockingEmbeddingClient(_FakeEmbeddingClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.started.set()
+        await self.release.wait()
+        return await super().embed_texts(texts)
+
+
 class _FakeGraphRepo:
     def __init__(
         self,
@@ -57,14 +72,22 @@ class _FakeGraphRepo:
         self._fulltext_batches = fulltext_batches or []
         self.embedding_upserts: list[tuple[list[EmbeddingCandidate], list[list[float]]]] = []
         self.fulltext_upserts: list[list[TextIndexCandidate]] = []
+        self.available = True
+
+    async def ensure_available(self):
+        if self.available:
+            return
+        raise Neo4jUnavailableError("Neo4j is unavailable; reload configuration to retry")
 
     async def prepare_embedding_candidates(self, scope, *, reindex, sample_limit):
         del scope, reindex, sample_limit
-        return {"entity": 0, "source": 1, "relation": 0}, []
+        total = sum(len(batch) for batch in self._embedding_batches)
+        return {"entity": 0, "source": total, "relation": 0}, []
 
     async def prepare_fulltext_candidates(self, scope, *, reindex, sample_limit):
         del scope, reindex, sample_limit
-        return {"entity": 1, "source": 0, "relation": 0}, []
+        total = sum(len(batch) for batch in self._fulltext_batches)
+        return {"entity": total, "source": 0, "relation": 0}, []
 
     async def list_embedding_candidates(self, scope, *, limit, reindex, exclude_source_keys):
         del scope, limit, reindex, exclude_source_keys
@@ -377,6 +400,45 @@ async def test_indexing_service_fulltext_backfill_runs_to_completion():
     assert graph_repo.fulltext_upserts
 
 
+async def test_indexing_service_pending_count_tracks_remaining_candidates():
+    candidate_one = EmbeddingCandidate(
+        source_type=EmbeddingSourceType.source,
+        source_key="https://example.com/page-1",
+        embedding_key="source:https://example.com/page-1",
+        input_text="示例页面摘要 1",
+        target_hash="hash-1",
+    )
+    candidate_two = EmbeddingCandidate(
+        source_type=EmbeddingSourceType.source,
+        source_key="https://example.com/page-2",
+        embedding_key="source:https://example.com/page-2",
+        input_text="示例页面摘要 2",
+        target_hash="hash-2",
+    )
+    graph_repo = _FakeGraphRepo(embedding_batches=[[candidate_one], [candidate_two], []])
+    embedding_client = _BlockingEmbeddingClient()
+    store = InMemoryIndexJobStore()
+    service = IndexingService(
+        Settings(OPENAI_EMBEDDING_API_KEY="key", EMBEDDING_BATCH_SIZE=1),
+        graph_repo,
+        embedding_client,
+        store,
+    )
+
+    created = await service.create_backfill_job(
+        IndexJobRequest(index_type=IndexType.vector, scope=IndexScope.source)
+    )
+    await asyncio.wait_for(embedding_client.started.wait(), timeout=1)
+    job = await service.get_job(created.job_id)
+    embedding_client.release.set()
+    await _wait_until_completed(service, created.job_id)
+    await service.shutdown()
+
+    assert job is not None
+    assert job.status == IndexJobStatus.running
+    assert job.pending_count == 1
+
+
 async def test_indexing_service_prepare_returns_counts():
     graph_repo = _FakeGraphRepo()
     embedding_client = _FakeEmbeddingClient()
@@ -390,6 +452,23 @@ async def test_indexing_service_prepare_returns_counts():
 
     assert prepared.total_count == 1
     assert prepared.counts["entity"] == 1
+
+
+async def test_indexing_service_prepare_returns_503_when_graph_unavailable():
+    graph_repo = _FakeGraphRepo()
+    graph_repo.available = False
+    embedding_client = _FakeEmbeddingClient()
+    store = InMemoryIndexJobStore()
+    service = IndexingService(Settings(OPENAI_EMBEDDING_API_KEY="key"), graph_repo, embedding_client, store)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.prepare(
+            IndexPreparationRequest(index_type=IndexType.fulltext, mode=IndexJobMode.backfill)
+        )
+
+    await service.shutdown()
+    assert exc_info.value.status_code == 503
+    assert "Neo4j is unavailable" in str(exc_info.value.detail)
 
 
 class _FakeIndexingApi:
@@ -442,6 +521,7 @@ class _FakeIndexingApi:
 
 class _FakeContainer:
     def __init__(self) -> None:
+        self.auth = None
         self.jobs = None
         self.indexing = _FakeIndexingApi()
 

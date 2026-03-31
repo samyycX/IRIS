@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { apiFetch, notifyAuthRequired } from "@/lib/auth"
 
 interface JobEvent {
   created_at: string
@@ -46,7 +47,7 @@ export default function JobDetail() {
 
     const loadJob = async () => {
       try {
-        const res = await fetch(`/api/jobs/${jobId}`)
+        const res = await apiFetch(`/api/jobs/${jobId}`)
         const data = await res.json()
         setJob(data)
       } catch (err) {
@@ -56,7 +57,7 @@ export default function JobDetail() {
 
     const loadEvents = async () => {
       try {
-        const res = await fetch(`/api/jobs/${jobId}/events`)
+        const res = await apiFetch(`/api/jobs/${jobId}/events`)
         const data = await res.json()
         if (Array.isArray(data)) {
           setEvents(data)
@@ -92,6 +93,9 @@ export default function JobDetail() {
     evtSource.onerror = () => {
       // Don't log error if it's just a normal close
       if (evtSource.readyState === EventSource.CLOSED) return
+      if (evtSource.readyState === EventSource.CONNECTING) {
+        notifyAuthRequired()
+      }
       evtSource.close()
     }
 
@@ -111,7 +115,7 @@ export default function JobDetail() {
   const handleResume = async () => {
     if (!jobId) return
     try {
-      const res = await fetch(`/api/jobs/${jobId}/resume`, { method: 'POST' })
+      const res = await apiFetch(`/api/jobs/${jobId}/resume`, { method: 'POST' })
       if (!res.ok) {
         throw new Error(`Resume failed: ${res.status}`)
       }
@@ -126,7 +130,7 @@ export default function JobDetail() {
   const handlePause = async () => {
     if (!jobId) return
     try {
-      const res = await fetch(`/api/jobs/${jobId}/pause`, { method: 'POST' })
+      const res = await apiFetch(`/api/jobs/${jobId}/pause`, { method: 'POST' })
       if (!res.ok) {
         throw new Error(`Pause failed: ${res.status}`)
       }
@@ -141,7 +145,7 @@ export default function JobDetail() {
   const handleCancel = async () => {
     if (!jobId) return
     try {
-      const res = await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' })
+      const res = await apiFetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' })
       if (!res.ok) {
         throw new Error(`Cancel failed: ${res.status}`)
       }

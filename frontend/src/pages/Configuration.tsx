@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { apiFetch } from '@/lib/auth'
 
 interface Profile {
   id: string;
@@ -65,7 +66,7 @@ export default function Configuration() {
 
   const fetchConfig = async () => {
     try {
-      const res = await fetch('/api/config');
+      const res = await apiFetch('/api/config');
       const data = await res.json();
       setConfig(data);
     } catch (err) {
@@ -88,7 +89,7 @@ export default function Configuration() {
     setConfig(newConfig); // optimistic update
 
     try {
-      await fetch('/api/config', {
+      await apiFetch('/api/config', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newConfig)
@@ -103,9 +104,9 @@ export default function Configuration() {
   const setActiveProfile = async (kind: string, id: string | null) => {
     try {
       if (id) {
-        await fetch(`/api/config/data-sources/${kind}/active/${id}`, { method: 'PUT' });
+        await apiFetch(`/api/config/data-sources/${kind}/active/${id}`, { method: 'PUT' });
       } else {
-        await fetch(`/api/config/data-sources/${kind}/active`, { method: 'DELETE' });
+        await apiFetch(`/api/config/data-sources/${kind}/active`, { method: 'DELETE' });
       }
       fetchConfig();
     } catch (err) {
@@ -115,7 +116,7 @@ export default function Configuration() {
 
   const deleteProfile = async (kind: string, id: string) => {
     try {
-      await fetch(`/api/config/data-sources/${kind}/${id}`, { method: 'DELETE' });
+      await apiFetch(`/api/config/data-sources/${kind}/${id}`, { method: 'DELETE' });
       fetchConfig();
     } catch (err) {
       console.error(err);
@@ -143,13 +144,13 @@ export default function Configuration() {
     }
     try {
       if (isNew) {
-        await fetch(`/api/config/data-sources/${kind}`, {
+        await apiFetch(`/api/config/data-sources/${kind}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
       } else {
-        await fetch(`/api/config/data-sources/${kind}/${profile.id}`, {
+        await apiFetch(`/api/config/data-sources/${kind}/${profile.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)

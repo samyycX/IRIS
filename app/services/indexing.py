@@ -25,7 +25,7 @@ from app.models import (
     SearchPreviewResponse,
     TextIndexCandidate,
 )
-from app.repos.graph_repo import Neo4jGraphRepository
+from app.repos.graph_repo import Neo4jGraphRepository, Neo4jUnavailableError
 from app.repos.index_job_store import IndexJobStore
 from app.services.llm.embedding_client import EmbeddingClient
 
@@ -67,6 +67,7 @@ class IndexingService:
         return await self._job_store.get_events(job_id)
 
     async def prepare(self, request: IndexPreparationRequest) -> IndexPreparationResponse:
+        await self._ensure_graph_available()
         if request.index_type == IndexType.vector:
             self._ensure_embedding_enabled()
             counts, candidates = await self._graph_repo.prepare_embedding_candidates(
@@ -119,15 +120,19 @@ class IndexingService:
         return created, skipped
 
     async def get_statuses(self) -> IndexStatusResponse:
+        await self._ensure_graph_available()
         return IndexStatusResponse(indexes=await self._graph_repo.get_index_statuses())
 
     async def ensure_fulltext_indexes(self) -> IndexStatusResponse:
+        await self._ensure_graph_available()
         return IndexStatusResponse(indexes=await self._graph_repo.ensure_fulltext_indexes())
 
     async def rebuild_fulltext_indexes(self, scope: IndexScope) -> IndexStatusResponse:
+        await self._ensure_graph_available()
         return IndexStatusResponse(indexes=await self._graph_repo.rebuild_fulltext_indexes(scope))
 
     async def query_preview(self, request: SearchPreviewRequest) -> SearchPreviewResponse:
+        await self._ensure_graph_available()
         payload = await self._graph_repo.query_preview(
             request.query,
             mode=request.mode,
@@ -142,6 +147,7 @@ class IndexingService:
         mode: IndexJobMode,
         request: IndexJobRequest,
     ) -> IndexJobSummary:
+        await self._ensure_graph_available()
         if request.index_type == IndexType.vector:
             self._ensure_embedding_enabled()
         await self._ensure_no_conflicting_job(request.index_type, request.scope)
@@ -200,6 +206,13 @@ class IndexingService:
         synced_count = 0
         failed_count = 0
         try:
+            total_pending = await self._count_pending_candidates(
+                request.index_type,
+                request.scope,
+                reindex=job.mode == IndexJobMode.reindex,
+            )
+            await self._job_store.update_job(job_id, pending_count=total_pending)
+
             while True:
                 if request.index_type == IndexType.vector:
                     candidates = await self._graph_repo.list_embedding_candidates(
@@ -225,9 +238,10 @@ class IndexingService:
                     break
 
                 attempted.update(candidate.source_key for candidate in candidates)
+                remaining_after_dispatch = max(total_pending - scanned_count - len(candidates), 0)
                 await self._job_store.update_job(
                     job_id,
-                    pending_count=len(candidates),
+                    pending_count=remaining_after_dispatch,
                     scanned_count=scanned_count,
                     synced_count=synced_count,
                     failed_count=failed_count,
@@ -252,7 +266,7 @@ class IndexingService:
                     scanned_count=scanned_count,
                     synced_count=synced_count,
                     failed_count=failed_count,
-                    pending_count=0,
+                    pending_count=max(total_pending - scanned_count, 0),
                 )
 
             await self._job_store.finish_job(job_id, status=IndexJobStatus.completed)
@@ -348,8 +362,35 @@ class IndexingService:
                 detail=f"已有运行中的 {index_type.value} 索引任务：{active.job_id}",
             )
 
+    async def _count_pending_candidates(
+        self,
+        index_type: IndexType,
+        scope: IndexScope,
+        *,
+        reindex: bool,
+    ) -> int:
+        if index_type == IndexType.vector:
+            counts, _ = await self._graph_repo.prepare_embedding_candidates(
+                scope,
+                reindex=reindex,
+                sample_limit=0,
+            )
+        else:
+            counts, _ = await self._graph_repo.prepare_fulltext_candidates(
+                scope,
+                reindex=reindex,
+                sample_limit=0,
+            )
+        return sum(counts.values())
+
     def _ensure_embedding_enabled(self) -> None:
         if self._embedding_client.enabled:
             return
         raise HTTPException(status_code=503, detail="Embedding client is not configured")
+
+    async def _ensure_graph_available(self) -> None:
+        try:
+            await self._graph_repo.ensure_available()
+        except Neo4jUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 

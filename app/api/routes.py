@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from sse_starlette import EventSourceResponse
 
 from app.models import (
     AppConfig,
+    AuthLoginRequest,
+    AuthStatusResponse,
     ConfigSummaryResponse,
     DataSourceKind,
     EmbeddingProfile,
@@ -27,6 +29,36 @@ router = APIRouter(prefix="/api", tags=["api"])
 
 def _container(request: Request):
     return request.app.state.container
+
+
+@router.get("/auth/status")
+async def auth_status(request: Request) -> AuthStatusResponse:
+    auth = _container(request).auth
+    return AuthStatusResponse(
+        bypass_enabled=auth.bypass_enabled,
+        authenticated=auth.is_request_authenticated(request),
+    )
+
+
+@router.post("/auth/login")
+async def login(request: Request, payload: AuthLoginRequest, response: Response) -> AuthStatusResponse:
+    auth = _container(request).auth
+    if auth.bypass_enabled:
+        return AuthStatusResponse(bypass_enabled=True, authenticated=True)
+    if not auth.verify_password(payload.password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password")
+    auth.attach_session_cookie(response)
+    return AuthStatusResponse(bypass_enabled=False, authenticated=True)
+
+
+@router.post("/auth/logout")
+async def logout(request: Request, response: Response) -> AuthStatusResponse:
+    auth = _container(request).auth
+    auth.clear_session_cookie(request, response)
+    return AuthStatusResponse(
+        bypass_enabled=auth.bypass_enabled,
+        authenticated=False if not auth.bypass_enabled else True,
+    )
 
 
 @router.post("/jobs")

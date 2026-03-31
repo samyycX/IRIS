@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { apiFetch } from '@/lib/auth'
 
 interface IndexJob {
   job_id: string
@@ -44,7 +45,7 @@ export default function IndexJobDetail() {
 
   const loadJob = async () => {
     try {
-      const res = await fetch(`/api/indexing/jobs/${jobId}`)
+      const res = await apiFetch(`/api/indexing/jobs/${jobId}`)
       if (res.ok) {
         setJob(await res.json())
       }
@@ -55,7 +56,7 @@ export default function IndexJobDetail() {
 
   const loadEvents = async () => {
     try {
-      const res = await fetch(`/api/indexing/jobs/${jobId}/events`)
+      const res = await apiFetch(`/api/indexing/jobs/${jobId}/events`)
       if (res.ok) {
         setEvents(await res.json())
       }

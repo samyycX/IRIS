@@ -36,6 +36,22 @@ cd ..
 python -m app.main
 ```
 
+启动前还必须配置前端访问门禁，二选一：
+
+```bash
+IRIS_PASSWORD=replace-me
+```
+
+或在本地临时跳过密码：
+
+```bash
+IRIS_PASSWORD_BYPASS=true
+```
+
+如果两者都没有设置，后端会在启动时直接报错：`IRIS_PASSWORD OR IRIS_PASSWORD_BYPASS not set`。
+
+当设置了 `IRIS_PASSWORD` 时，前端需要先输入密码，验证通过后才会访问 `/api/*` 和 `/status`。后端会使用 Argon2id 对启动时读取到的密码做内存哈希，并通过同源 HttpOnly Cookie 维持登录态。
+
 默认情况下，应用使用进程内后台任务执行器，已访问 URL 会以 JSON 结构持久化到 `VISITED_URLS_FILE` 指定的位置，并记录最近访问时间，无需 Redis。历史 URL 默认只会在 `10` 天内跳过；超过这个时间会允许重新抓取。这个窗口可通过 `.env` 中的 `VISITED_URL_TTL_DAYS` 调整。
 
 启动时应用还会自动执行 Neo4j 图数据迁移。迁移文件位于 `app/repos/migrations/`，命名格式为 `V<number>__name.cypher`。系统会按版本顺序执行，并把执行记录写入 Neo4j 的 `MigrationState` / `MigrationRecord` 节点。

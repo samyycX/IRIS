@@ -1,3 +1,4 @@
+from app.models.auth import AuthLoginRequest, AuthStatusResponse
 from app.models.jobs import (
     CrawlContext,
     CrawlPageResult,
@@ -49,8 +50,16 @@ from app.models.indexing import (
     SearchPreviewResponse,
     TextIndexCandidate,
 )
+from app.models.runtime_status import (
+    DependencyHealthState,
+    DependencyStatus,
+    GraphStatistics,
+    RuntimeStatusResponse,
+)
 
 __all__ = [
+    "AuthLoginRequest",
+    "AuthStatusResponse",
     "CrawlContext",
     "CrawlPageResult",
     "ExtractedEntity",
@@ -95,5 +104,9 @@ __all__ = [
     "SearchPreviewRequest",
     "SearchPreviewResponse",
     "TextIndexCandidate",
+    "DependencyHealthState",
+    "DependencyStatus",
+    "GraphStatistics",
+    "RuntimeStatusResponse",
     "utcnow",
 ]

@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { apiFetch } from '@/lib/auth'
 
 type Scope = 'all' | 'entity' | 'source' | 'relation'
 type IndexType = 'vector' | 'fulltext'
@@ -29,16 +30,6 @@ interface IndexPlan {
   scope: Scope
   total_count: number
   counts: Record<string, number>
-  candidates: Array<{
-    source_type: string
-    source_key: string
-    title?: string | null
-    name?: string | null
-    summary?: string | null
-    aggregated_text?: string | null
-    left_entity_name?: string | null
-    right_entity_name?: string | null
-  }>
 }
 
 interface IndexJobSummary {
@@ -89,14 +80,14 @@ function IndexOperationCard({
   const handlePrepare = async (mode: Mode) => {
     setLoading(true)
     try {
-      const res = await fetch('/api/indexing/prepare', {
+      const res = await apiFetch('/api/indexing/prepare', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           index_type: indexType,
           mode,
           scope,
-          sample_limit: 8,
+          sample_limit: 0,
         }),
       })
       const data = await res.json()
@@ -117,7 +108,7 @@ function IndexOperationCard({
   const handleRun = async () => {
     setLoading(true)
     try {
-      const res = await fetch(`/api/indexing/${planMode}`, {
+      const res = await apiFetch(`/api/indexing/${planMode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -144,7 +135,7 @@ function IndexOperationCard({
   const handleEnsureFulltext = async () => {
     setLoading(true)
     try {
-      const res = await fetch('/api/indexing/fulltext/build', { method: 'POST' })
+      const res = await apiFetch('/api/indexing/fulltext/build', { method: 'POST' })
       const data = await res.json()
       if (!res.ok) {
         alert(data.detail || 'Failed to build fulltext indexes')
@@ -161,7 +152,7 @@ function IndexOperationCard({
   const handleRebuildFulltext = async () => {
     setLoading(true)
     try {
-      const res = await fetch(`/api/indexing/fulltext/rebuild/${scope}`, { method: 'POST' })
+      const res = await apiFetch(`/api/indexing/fulltext/rebuild/${scope}`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) {
         alert(data.detail || 'Failed to rebuild fulltext indexes')
@@ -258,26 +249,6 @@ function IndexOperationCard({
                 entity={plan.counts.entity || 0}, source={plan.counts.source || 0}, relation={plan.counts.relation || 0}
               </div>
             </div>
-            <div className="space-y-2">
-              <div className="text-sm font-medium">{t('index.candidate_samples')}</div>
-              <div className="space-y-2">
-                {plan.candidates.map((candidate) => (
-                  <div key={`${candidate.source_type}-${candidate.source_key}`} className="rounded border p-2 text-sm">
-                    <div className="font-medium">
-                      {candidate.name || candidate.title || candidate.source_key}
-                    </div>
-                    <div className="text-muted-foreground">
-                      {candidate.left_entity_name && candidate.right_entity_name
-                        ? `${candidate.left_entity_name} -> ${candidate.right_entity_name}`
-                        : candidate.source_key}
-                    </div>
-                  </div>
-                ))}
-                {plan.candidates.length === 0 && (
-                  <div className="text-sm text-muted-foreground">{t('index.no_candidates')}</div>
-                )}
-              </div>
-            </div>
 
             <Button onClick={handleRun} disabled={loading || plan.total_count === 0}>
               {t('index.confirm_and_run')}
@@ -296,7 +267,7 @@ export default function IndexManagement() {
 
   const loadJobs = async () => {
     try {
-      const res = await fetch('/api/indexing/jobs')
+      const res = await apiFetch('/api/indexing/jobs')
       if (res.ok) {
         setJobs(await res.json())
       }
@@ -307,7 +278,7 @@ export default function IndexManagement() {
 
   const loadStatuses = async () => {
     try {
-      const res = await fetch('/api/indexing/status')
+      const res = await apiFetch('/api/indexing/status')
       if (res.ok) {
         const data = await res.json()
         setStatuses(data.indexes || [])

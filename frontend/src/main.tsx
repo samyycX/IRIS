@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router-dom'
 import './index.css'
 import App from './App.tsx'
 import './i18n'
+import { AuthProvider } from './lib/auth'
 
 function Root() {
   useEffect(() => {
@@ -12,9 +13,11 @@ function Root() {
 
   return (
     <StrictMode>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
+      <AuthProvider>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </AuthProvider>
     </StrictMode>
   )
 }

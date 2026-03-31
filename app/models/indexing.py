@@ -56,7 +56,7 @@ class IndexPreparationRequest(BaseModel):
     index_type: IndexType
     mode: IndexJobMode
     scope: IndexScope = IndexScope.all
-    sample_limit: int = Field(default=20, ge=1, le=100)
+    sample_limit: int = Field(default=20, ge=0, le=100)
 
 
 class IndexCandidateSample(BaseModel):

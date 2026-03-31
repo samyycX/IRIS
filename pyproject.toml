@@ -9,6 +9,7 @@ description = "通用知识图谱自动采集与图谱更新系统"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "argon2-cffi",
   "beautifulsoup4",
   "fastapi",
   "httpx",

@@ -19,6 +19,7 @@ from app.services.crawl import (
     URLCanonicalizer,
 )
 from app.services.app_config import AppConfigService
+from app.services.auth import PasswordGateService
 from app.services.graphrag import GraphRAGRetriever, GraphRAGWorkflow
 from app.services.jobs import JobService
 from app.services.kg import KnowledgeGraphService
@@ -26,6 +27,7 @@ from app.services.local_data import LocalDataStore
 from app.services.llm import EmbeddingClient, LLMClient
 from app.services.llm.orchestrator import LlmOrchestrator
 from app.services.indexing import IndexingService
+from app.services.runtime_status import RuntimeStatusService
 from app.services.tools import (
     DiscoverLinksTool,
     ExtractMainContentTool,
@@ -52,6 +54,10 @@ class ServiceContainer:
         self.settings: Settings | None = None
         self.local_data = LocalDataStore(settings.data_root)
         self.config_service = AppConfigService(settings, self.local_data)
+        self.auth = PasswordGateService(
+            password=settings.iris_password,
+            bypass_enabled=settings.iris_password_bypass,
+        )
 
         self.event_store: Neo4jJobStore | None = None
         self.embedding_client: EmbeddingClient | None = None
@@ -73,6 +79,7 @@ class ServiceContainer:
         self.indexing: IndexingService | None = None
         self.pipeline: CrawlPipeline | None = None
         self.jobs: JobService | None = None
+        self.runtime_status: RuntimeStatusService | None = None
 
     async def initialize(self) -> None:
         await self.reload_runtime()
@@ -92,6 +99,7 @@ class ServiceContainer:
         except _NEO4J_STARTUP_FAILURES as exc:
             await self._degrade_neo4j_after_startup_failure(exc)
         await self.indexing.initialize()
+        await self.runtime_status.start()
 
     async def _degrade_neo4j_after_startup_failure(self, exc: BaseException) -> None:
         logger.warning(
@@ -101,7 +109,7 @@ class ServiceContainer:
             hint="Application continues without Neo4j; fix URI or credentials and reload configuration.",
         )
         if self.graph_repo is not None:
-            await self.graph_repo.mark_neo4j_unavailable()
+            await self.graph_repo.mark_neo4j_unavailable(str(exc))
         if self.migrations is not None:
             await self.migrations.mark_neo4j_unavailable()
         if self.event_store is not None:
@@ -158,14 +166,26 @@ class ServiceContainer:
             auto_backfill_indexes_after_crawl=settings.auto_backfill_indexes_after_crawl,
         )
         self.jobs = JobService(settings, self.event_store, self.pipeline)
+        self.runtime_status = RuntimeStatusService(
+            settings=settings,
+            graph_repo=self.graph_repo,
+            llm_client=self.llm_client,
+            embedding_client=self.embedding_client,
+        )
 
     async def _close_runtime_components(self) -> None:
+        if self.runtime_status is not None:
+            await self.runtime_status.shutdown()
         if self.indexing is not None:
             await self.indexing.shutdown()
         if self.jobs is not None:
             await self.jobs.shutdown()
         if self.fetcher is not None:
             await self.fetcher.close()
+        if self.llm_client is not None:
+            await self.llm_client.close()
+        if self.embedding_client is not None:
+            await self.embedding_client.close()
         if self.migrations is not None:
             await self.migrations.close()
         if self.graph_repo is not None:

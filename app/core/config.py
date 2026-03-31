@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.models.config import AppConfig
@@ -111,10 +111,21 @@ class BootstrapSettings(BaseSettings):
     model_config = SettingsConfigDict(
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     iris_docker_env: bool = Field(default=False, alias="IRIS_DOCKER_ENV")
     iris_data_root: str | None = Field(default=None, alias="IRIS_DATA_ROOT")
+    iris_password: str = Field(default="", alias="IRIS_PASSWORD")
+    iris_password_bypass: bool = Field(default=False, alias="IRIS_PASSWORD_BYPASS")
+
+    @model_validator(mode="after")
+    def validate_password_gate(self) -> "BootstrapSettings":
+        if self.iris_password_bypass:
+            return self
+        if self.iris_password:
+            return self
+        raise ValueError("IRIS_PASSWORD OR IRIS_PASSWORD_BYPASS not set")
 
     @computed_field
     @property

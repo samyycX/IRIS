@@ -55,14 +55,24 @@ HYBRID_RRF_K = 60
 _LUCENE_SPECIAL_CHAR_PATTERN = re.compile(r'([+\-!(){}\[\]^"~*?:\\/&|])')
 
 
+class Neo4jUnavailableError(RuntimeError):
+    pass
+
+
 class Neo4jGraphRepository:
     def __init__(self, settings: Settings, embedding_client: EmbeddingClient | None = None) -> None:
         self._settings = settings
         self._embedding_client = embedding_client
         self._driver = None
-        self.enabled = bool(
+        self._configured = bool(
             settings.neo4j_uri and settings.neo4j_username and settings.neo4j_password
         )
+        self.enabled = self._configured
+        self._availability_error: str | None = None
+
+    @property
+    def configured(self) -> bool:
+        return self._configured
 
     async def connect(self) -> None:
         if not self.enabled or self._driver is not None:
@@ -76,6 +86,74 @@ class Neo4jGraphRepository:
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
+
+    def unavailable_detail(self) -> str:
+        if not self._configured:
+            return "Neo4j is not configured"
+        return self._availability_error or "Neo4j is unavailable; reload configuration to retry"
+
+    async def ensure_available(self) -> None:
+        healthy, error = await self.check_health()
+        if healthy:
+            return
+        raise Neo4jUnavailableError(error or self.unavailable_detail())
+
+    async def check_health(self) -> tuple[bool, str | None]:
+        if not self._configured:
+            return False, None
+        if not self.enabled:
+            return False, self.unavailable_detail()
+        try:
+            await self.connect()
+            if self._driver is None:
+                raise Neo4jUnavailableError("Neo4j driver is not initialized")
+            await self._driver.verify_connectivity()
+            self._availability_error = None
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            self._availability_error = str(exc)
+            return False, str(exc)
+
+    async def get_graph_counts(self) -> dict[str, int]:
+        counts = {
+            "entity_count": 0,
+            "source_count": 0,
+            "relation_count": 0,
+        }
+        records = await self._query_read_records(
+            "get_graph_counts",
+            """
+            CALL () {
+                MATCH (entity:Entity)
+                RETURN count(entity) AS entity_count
+            }
+            CALL () {
+                MATCH (source:Source)
+                RETURN count(source) AS source_count
+            }
+            CALL () {
+                MATCH ()-[relation:RELATED_TO]->()
+                RETURN count(relation) AS relation_count
+            }
+            RETURN entity_count, source_count, relation_count
+            """,
+        )
+        if not records:
+            return counts
+        row = records[0]
+        counts["entity_count"] = int(row.get("entity_count") or 0)
+        counts["source_count"] = int(row.get("source_count") or 0)
+        counts["relation_count"] = int(row.get("relation_count") or 0)
+        return counts
+
+    async def _ensure_driver_connected(self) -> bool:
+        if not self.enabled:
+            return False
+        await self.connect()
+        if self._driver is None:
+            self._availability_error = self._availability_error or "Neo4j driver is not initialized"
+            return False
+        return True
 
     async def ensure_constraints(self) -> None:
         if not self.enabled:
@@ -103,9 +181,10 @@ class Neo4jGraphRepository:
             for statement in statements:
                 await session.run(statement)
 
-    async def mark_neo4j_unavailable(self) -> None:
+    async def mark_neo4j_unavailable(self, reason: str | None = None) -> None:
         """Turn off graph persistence after a failed connection or auth; closes drivers."""
         self.enabled = False
+        self._availability_error = reason or self._availability_error or self.unavailable_detail()
         if self._driver is not None:
             await self._driver.close()
             self._driver = None
@@ -539,9 +618,8 @@ class Neo4jGraphRepository:
         ]
 
     async def get_index_statuses(self) -> list[IndexStatusEntry]:
-        if not self.enabled:
+        if not await self._ensure_driver_connected():
             return []
-        await self.connect()
         managed = {
             (IndexType.vector.value, IndexScope.entity.value): ENTITY_EMBEDDING_INDEX_NAME,
             (IndexType.vector.value, IndexScope.source.value): SOURCE_EMBEDDING_INDEX_NAME,
@@ -571,18 +649,16 @@ class Neo4jGraphRepository:
         return statuses
 
     async def ensure_fulltext_indexes(self) -> list[IndexStatusEntry]:
-        if not self.enabled:
+        if not await self._ensure_driver_connected():
             return []
-        await self.connect()
         async with self._driver.session() as session:
             for statement in _FULLTEXT_INDEX_CREATE_STATEMENTS:
                 await session.run(statement)
         return await self.get_index_statuses()
 
     async def rebuild_fulltext_indexes(self, scope: IndexScope = IndexScope.all) -> list[IndexStatusEntry]:
-        if not self.enabled:
+        if not await self._ensure_driver_connected():
             return []
-        await self.connect()
         statements = _fulltext_rebuild_statements(scope)
         async with self._driver.session() as session:
             for statement in statements:
@@ -1643,7 +1719,8 @@ class Neo4jGraphRepository:
         candidates: list[EmbeddingCandidate] = []
         offset = 0
         page_size = max(limit * 4, 64)
-        await self.connect()
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
@@ -1709,7 +1786,8 @@ class Neo4jGraphRepository:
         candidates: list[EmbeddingCandidate] = []
         offset = 0
         page_size = max(limit * 4, 64)
-        await self.connect()
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
@@ -1766,7 +1844,8 @@ class Neo4jGraphRepository:
         candidates: list[EmbeddingCandidate] = []
         offset = 0
         page_size = max(limit * 4, 64)
-        await self.connect()
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
@@ -1831,7 +1910,8 @@ class Neo4jGraphRepository:
         candidates: list[TextIndexCandidate] = []
         offset = 0
         page_size = max(limit * 4, 64)
-        await self.connect()
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
@@ -1886,7 +1966,8 @@ class Neo4jGraphRepository:
         candidates: list[TextIndexCandidate] = []
         offset = 0
         page_size = max(limit * 4, 64)
-        await self.connect()
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
@@ -1941,7 +2022,8 @@ class Neo4jGraphRepository:
         candidates: list[TextIndexCandidate] = []
         offset = 0
         page_size = max(limit * 4, 64)
-        await self.connect()
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             while len(candidates) < limit:
                 result = await session.run(
@@ -2185,7 +2267,9 @@ class Neo4jGraphRepository:
         cypher: str,
         **params: Any,
     ) -> list[dict[str, Any]]:
-        await self.connect()
+        del query_name
+        if not await self._ensure_driver_connected():
+            return []
         async with self._driver.session() as session:
             result = await session.run(cypher, parameters=params)
             return [record.data() async for record in result]

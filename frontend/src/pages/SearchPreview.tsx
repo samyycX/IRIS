@@ -25,6 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { apiFetch } from '@/lib/auth'
 
 type SearchMode = 'hybrid' | 'vector' | 'fulltext'
 
@@ -48,7 +49,7 @@ export default function SearchPreview() {
     event.preventDefault()
     setLoading(true)
     try {
-      const res = await fetch('/api/indexing/query-preview', {
+      const res = await apiFetch('/api/indexing/query-preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

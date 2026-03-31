@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from time import monotonic
 from typing import Any
@@ -267,6 +268,23 @@ class LLMClient:
         )
         return normalized_selected_urls
 
+    async def check_health(self) -> tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        client = self._require_client()
+        try:
+            await client.models.list()
+            return True, None
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    async def close(self) -> None:
+        client = self._client
+        self._client = None
+        self._merge_chain = None
+        if client is not None:
+            await _close_async_resource(client)
+
     def _require_client(self) -> AsyncOpenAI:
         if self._client is None:
             raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -288,6 +306,17 @@ class LLMClient:
         if self._merge_chain is None:
             raise RuntimeError("OPENAI_API_KEY is not configured")
         return self._merge_chain
+
+
+async def _close_async_resource(resource: Any) -> None:
+    for method_name in ("close", "aclose"):
+        method = getattr(resource, method_name, None)
+        if not callable(method):
+            continue
+        result = method()
+        if inspect.isawaitable(result):
+            await result
+        return
 
 def _normalize_candidate_url_entity_context(
     contexts: list[dict[str, Any]],

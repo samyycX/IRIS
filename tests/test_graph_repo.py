@@ -4,6 +4,7 @@ from app.core.config import Settings
 from app.models import (
     ExtractedEntity,
     GraphUpdateResult,
+    IndexScope,
     JobInputType,
     JobStatus,
     JobSummary,
@@ -317,6 +318,45 @@ async def test_query_fulltext_sources_escapes_query_before_running_cypher():
         "limit": 3,
     }
     assert kwargs == {}
+
+
+async def test_prepare_embedding_candidates_returns_empty_when_neo4j_is_degraded():
+    repo = Neo4jGraphRepository(
+        Settings(
+            NEO4J_URI="neo4j://127.0.0.1:7687",
+            NEO4J_USERNAME="neo4j",
+            NEO4J_PASSWORD="pw",
+        )
+    )
+    await repo.mark_neo4j_unavailable("startup failed")
+
+    counts, samples = await repo.prepare_embedding_candidates(
+        IndexScope.all,
+        reindex=False,
+        sample_limit=10,
+    )
+
+    assert counts == {"entity": 0, "source": 0, "relation": 0}
+    assert samples == []
+
+
+async def test_get_graph_counts_returns_zero_when_neo4j_is_degraded():
+    repo = Neo4jGraphRepository(
+        Settings(
+            NEO4J_URI="neo4j://127.0.0.1:7687",
+            NEO4J_USERNAME="neo4j",
+            NEO4J_PASSWORD="pw",
+        )
+    )
+    await repo.mark_neo4j_unavailable("startup failed")
+
+    counts = await repo.get_graph_counts()
+
+    assert counts == {
+        "entity_count": 0,
+        "source_count": 0,
+        "relation_count": 0,
+    }
 
 
 async def test_update_visited_relation_tx_stores_page_modification_details():
