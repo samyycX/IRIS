@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Link } from 'react-router-dom'
 import { ChevronDown, ChevronUp, Check, Plus, Trash, Edit, ShieldCheck, ShieldOff } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -14,9 +15,27 @@ interface Profile {
   uri?: string;
   username?: string;
   password?: string;
+  knowledge_theme?: string;
   base_url?: string;
   api_key?: string;
   model?: string;
+}
+
+interface SearchPermissionSource {
+  id: string;
+  kind: 'api_key' | 'ip';
+  description: string;
+  enabled: boolean;
+  allow_builtin_embedding: boolean;
+  api_key_hash?: string | null;
+  key_prefix?: string | null;
+  ip_value?: string | null;
+}
+
+interface SearchApiConfig {
+  enabled: boolean;
+  validation_enabled: boolean;
+  permission_sources: SearchPermissionSource[];
 }
 
 interface Config {
@@ -28,6 +47,7 @@ interface Config {
   embedding_profiles: Profile[];
   active_embedding_profile_id: string | null;
   runtime: Record<string, any>;
+  search_api: SearchApiConfig;
 }
 
 // Inline Collapsible Card
@@ -35,7 +55,7 @@ const CollapsibleCard: React.FC<{
   title: string;
   children: React.ReactNode;
   defaultOpen?: boolean;
-}> = ({ title, children, defaultOpen = true }) => {
+}> = ({ title, children, defaultOpen = false }) => {
   const [isOpen, setIsOpen] = useState(defaultOpen);
   return (
     <Card className="mb-6">
@@ -100,6 +120,24 @@ export default function Configuration() {
     }
   };
 
+  const updateSearchApiSettings = async (patch: Partial<SearchApiConfig>) => {
+    if (!config) return;
+    const nextSettings = {
+      enabled: patch.enabled ?? config.search_api.enabled,
+      validation_enabled: patch.validation_enabled ?? config.search_api.validation_enabled,
+    };
+    try {
+      await apiFetch('/api/config/search-api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(nextSettings),
+      });
+      fetchConfig();
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   // Profile Management
   const setActiveProfile = async (kind: string, id: string | null) => {
     try {
@@ -131,6 +169,7 @@ export default function Configuration() {
         uri: String(profile.uri ?? ''),
         username: String(profile.username ?? ''),
         password: String(profile.password ?? ''),
+        knowledge_theme: String(profile.knowledge_theme ?? ''),
       };
     } else if (kind === 'llm' || kind === 'embedding') {
       payload = {
@@ -228,6 +267,11 @@ export default function Configuration() {
                     <Label>{t('config.profile.password')}</Label>
                     <Input type="password" value={editingProfile.profile.password || ''} onChange={e => setEditingProfile({ ...editingProfile, profile: { ...editingProfile.profile, password: e.target.value } })} />
                   </div>
+                  <div className="grid gap-2">
+                    <Label>{t('config.profile.knowledge_theme')}</Label>
+                    <Input value={editingProfile.profile.knowledge_theme || ''} onChange={e => setEditingProfile({ ...editingProfile, profile: { ...editingProfile.profile, knowledge_theme: e.target.value } })} />
+                    <span className="text-xs text-muted-foreground">{t('config.profile.knowledge_theme_desc')}</span>
+                  </div>
                 </>
               )}
 
@@ -263,7 +307,15 @@ export default function Configuration() {
           {profiles.map(p => (
             <div key={p.id} className="flex items-center justify-between p-3 border rounded-md bg-card">
               <div className="flex items-center gap-3">
-                <div className="font-medium">{p.id}</div>
+                <div>
+                  <div className="font-medium">{p.id}</div>
+                  {kind === 'neo4j' && (p.uri || p.knowledge_theme) && (
+                    <div className="text-xs text-muted-foreground">
+                      {p.uri || t('home.uri_hidden')}
+                      {p.knowledge_theme ? ` · ${t('config.profile.knowledge_theme')}: ${p.knowledge_theme}` : ''}
+                    </div>
+                  )}
+                </div>
                 {activeId === p.id && <Badge variant="default" className="ml-2 flex items-center gap-1"><Check className="w-3 h-3" /> {t('config.active_badge')}</Badge>}
               </div>
               <div className="flex items-center gap-2">
@@ -294,14 +346,6 @@ export default function Configuration() {
 
       <CollapsibleCard title={t('config.data_collection')}>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div className="grid gap-2 md:col-span-2">
-            <Label>{t('runtime.knowledge_theme')}</Label>
-            <Input 
-              defaultValue={config.runtime.knowledge_theme} 
-              onBlur={(e) => updateRuntimeField('knowledge_theme', e.target.value)} 
-            />
-            <span className="text-xs text-muted-foreground">{t('runtime.knowledge_theme_desc')}</span>
-          </div>
           <div className="grid gap-2">
             <Label>{t('runtime.visited_url_ttl_days')}</Label>
             <Input 
@@ -451,6 +495,42 @@ export default function Configuration() {
               onBlur={(e) => updateRuntimeField('embedding_text_max_chars', parseInt(e.target.value))} 
             />
             <span className="text-xs text-muted-foreground">{t('runtime.embedding_text_max_chars_desc')}</span>
+          </div>
+        </div>
+      </CollapsibleCard>
+
+      <CollapsibleCard title={t('config.search_api')}>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="flex items-center space-x-2 rounded-lg border bg-muted/30 p-4">
+            <Checkbox
+              id="search_api_enabled"
+              checked={config.search_api.enabled}
+              onCheckedChange={(checked) => updateSearchApiSettings({ enabled: !!checked })}
+            />
+            <div className="grid gap-1.5 leading-none">
+              <Label htmlFor="search_api_enabled">{t('config.search_api_enabled')}</Label>
+              <p className="text-xs text-muted-foreground">{t('config.search_api_enabled_desc')}</p>
+            </div>
+          </div>
+          <div className="flex items-center space-x-2 rounded-lg border bg-muted/30 p-4">
+            <Checkbox
+              id="search_api_validation_enabled"
+              checked={config.search_api.validation_enabled}
+              onCheckedChange={(checked) => updateSearchApiSettings({ validation_enabled: !!checked })}
+            />
+            <div className="grid gap-1.5 leading-none">
+              <Label htmlFor="search_api_validation_enabled">{t('config.search_api_validation_enabled')}</Label>
+              <p className="text-xs text-muted-foreground">{t('config.search_api_validation_enabled_desc')}</p>
+            </div>
+          </div>
+          <div className="md:col-span-2 flex flex-col md:flex-row items-start md:items-center justify-between rounded-lg border bg-muted/30 p-4">
+            <div className="grid gap-1.5 leading-none mb-3 md:mb-0">
+              <Label>{t('config.search_api_auth_sources_title')}</Label>
+              <p className="text-xs text-muted-foreground">{t('config.search_api_auth_sources_desc')}</p>
+            </div>
+            <Link to="/config/search-api-auth" className="inline-flex h-9 items-center justify-center rounded-md border border-input bg-background px-3 text-sm font-medium shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground">
+              {t('config.search_api_auth_sources_link')}
+            </Link>
           </div>
         </div>
       </CollapsibleCard>

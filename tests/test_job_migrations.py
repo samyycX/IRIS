@@ -4,6 +4,7 @@ from pathlib import Path
 from app.core.config import Settings
 from app.models import JobInputType, JobStatus
 from app.repos.graph_migrations import Neo4jMigrationManager
+from app.repos.neo4j_driver import NEO4J_DRIVER_CONFIG
 from app.repos.neo4j_job_store import Neo4jJobStore
 
 
@@ -51,6 +52,60 @@ def test_migration_manager_splits_multiple_statements():
     assert statements == [
         "MATCH (n)\n    RETURN count(n)",
         "CREATE (:Marker {name: 'done'})",
+    ]
+
+
+async def test_migration_manager_connect_sets_driver_notification_thresholds(monkeypatch):
+    calls: list[tuple[str, tuple[str, str], dict]] = []
+
+    def fake_driver(uri: str, *, auth=None, **config):
+        calls.append((uri, auth, config))
+        return object()
+
+    monkeypatch.setattr("app.repos.graph_migrations.AsyncGraphDatabase.driver", fake_driver)
+    manager = Neo4jMigrationManager(
+        Settings(
+            NEO4J_URI="neo4j://127.0.0.1:7687",
+            NEO4J_USERNAME="neo4j",
+            NEO4J_PASSWORD="pw",
+        )
+    )
+
+    await manager.connect()
+
+    assert calls == [
+        (
+            "neo4j://127.0.0.1:7687",
+            ("neo4j", "pw"),
+            NEO4J_DRIVER_CONFIG,
+        )
+    ]
+
+
+async def test_job_store_connect_sets_driver_notification_thresholds(monkeypatch):
+    calls: list[tuple[str, tuple[str, str], dict]] = []
+
+    def fake_driver(uri: str, *, auth=None, **config):
+        calls.append((uri, auth, config))
+        return object()
+
+    monkeypatch.setattr("app.repos.neo4j_job_store.AsyncGraphDatabase.driver", fake_driver)
+    store = Neo4jJobStore(
+        Settings(
+            NEO4J_URI="neo4j://127.0.0.1:7687",
+            NEO4J_USERNAME="neo4j",
+            NEO4J_PASSWORD="pw",
+        )
+    )
+
+    await store.connect()
+
+    assert calls == [
+        (
+            "neo4j://127.0.0.1:7687",
+            ("neo4j", "pw"),
+            NEO4J_DRIVER_CONFIG,
+        )
     ]
 
 

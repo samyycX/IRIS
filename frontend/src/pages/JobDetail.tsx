@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { apiFetch, notifyAuthRequired } from "@/lib/auth"
+import { apiFetch, fetchAuthStatus, notifyAuthRequired } from "@/lib/auth"
 
 interface JobEvent {
   created_at: string
@@ -42,14 +42,28 @@ export default function JobDetail() {
   const [streamVersion, setStreamVersion] = useState(0)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
+  const verifySession = async () => {
+    const status = await fetchAuthStatus()
+    if (status && !status.authenticated && !status.bypass_enabled) {
+      notifyAuthRequired()
+    }
+  }
+
   useEffect(() => {
     if (!jobId) return
+
+    let active = true
 
     const loadJob = async () => {
       try {
         const res = await apiFetch(`/api/jobs/${jobId}`)
+        if (!res.ok) {
+          return
+        }
         const data = await res.json()
-        setJob(data)
+        if (active) {
+          setJob(data)
+        }
       } catch (err) {
         console.error(err)
       }
@@ -58,8 +72,11 @@ export default function JobDetail() {
     const loadEvents = async () => {
       try {
         const res = await apiFetch(`/api/jobs/${jobId}/events`)
+        if (!res.ok) {
+          return
+        }
         const data = await res.json()
-        if (Array.isArray(data)) {
+        if (active && Array.isArray(data)) {
           setEvents(data)
         }
       } catch (err) {
@@ -93,13 +110,12 @@ export default function JobDetail() {
     evtSource.onerror = () => {
       // Don't log error if it's just a normal close
       if (evtSource.readyState === EventSource.CLOSED) return
-      if (evtSource.readyState === EventSource.CONNECTING) {
-        notifyAuthRequired()
-      }
+      void verifySession()
       evtSource.close()
     }
 
     return () => {
+      active = false
       evtSource.close()
     }
   }, [jobId, streamVersion])

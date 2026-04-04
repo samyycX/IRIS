@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
@@ -37,6 +37,7 @@ from app.services.llm.embedding_utils import (
     compute_embedding_content_hash,
     parse_relation_pair_key,
 )
+from app.repos.neo4j_driver import NEO4J_DRIVER_CONFIG
 from app.services.llm.pinyin import expand_aliases_with_pinyin
 
 if TYPE_CHECKING:
@@ -53,6 +54,7 @@ RELATION_FULLTEXT_INDEX_NAME = "relation_fulltext_index"
 DEFAULT_MENTIONED_IN_RELEVANCE = 0.5
 HYBRID_RRF_K = 60
 _LUCENE_SPECIAL_CHAR_PATTERN = re.compile(r'([+\-!(){}\[\]^"~*?:\\/&|])')
+_SOURCE_TRACKING_QUERY_PREFIXES = ("utm_", "spm", "fbclid", "gclid")
 
 
 class Neo4jUnavailableError(RuntimeError):
@@ -80,6 +82,7 @@ class Neo4jGraphRepository:
         self._driver = AsyncGraphDatabase.driver(
             self._settings.neo4j_uri,
             auth=(self._settings.neo4j_username, self._settings.neo4j_password),
+            **NEO4J_DRIVER_CONFIG,
         )
 
     async def close(self) -> None:
@@ -192,27 +195,279 @@ class Neo4jGraphRepository:
     async def source_exists(self, canonical_url: str) -> bool:
         if not self.enabled:
             return False
+        candidate_urls = _build_source_lookup_variants(canonical_url)
         records = await self._query_read_records(
             "source_exists",
-            "MATCH (s:Source {canonical_url: $canonical_url}) RETURN count(s) > 0 AS exists",
-            canonical_url=canonical_url,
+            "MATCH (s:Source) WHERE s.canonical_url IN $candidate_urls RETURN count(s) > 0 AS exists",
+            candidate_urls=candidate_urls,
         )
         return bool(records and records[0].get("exists"))
 
     async def source_fetched_since(self, canonical_url: str, cutoff: datetime) -> bool:
         if not self.enabled:
             return False
+        candidate_urls = _build_source_lookup_variants(canonical_url)
         records = await self._query_read_records(
             "source_fetched_since",
             """
-            MATCH (s:Source {canonical_url: $canonical_url})
+            MATCH (s:Source)
+            WHERE s.canonical_url IN $candidate_urls
             RETURN s.fetched_at IS NOT NULL
                AND s.fetched_at >= datetime($cutoff) AS is_recent
             """,
-            canonical_url=canonical_url,
+            candidate_urls=candidate_urls,
             cutoff=cutoff.isoformat(),
         )
         return bool(records and records[0].get("is_recent"))
+
+    async def get_entity_detail(
+        self,
+        entity_id: str,
+        *,
+        source_limit: int = 10,
+        relation_limit: int = 10,
+    ) -> dict[str, Any] | None:
+        if not self.enabled or not entity_id.strip():
+            return None
+        records = await self._query_read_records(
+            "get_entity_detail",
+            """
+            MATCH (entity:Entity {entity_id: $entity_id})
+            CALL {
+                WITH entity
+                MATCH (entity)-[rel:RELATED_TO]->(target:Entity)
+                WITH rel, target
+                ORDER BY coalesce(rel.relevance, 0.0) DESC, target.name ASC, target.entity_id ASC
+                RETURN collect(
+                    {
+                        relation_type: coalesce(rel.relation_type, "RELATED_TO"),
+                        entity_id: target.entity_id,
+                        name: target.name,
+                        evidence: rel.evidence
+                    }
+                )[..$relation_limit] AS outgoing_relations
+            }
+            CALL {
+                WITH entity
+                MATCH (source_entity:Entity)-[rel:RELATED_TO]->(entity)
+                WITH rel, source_entity
+                ORDER BY coalesce(rel.relevance, 0.0) DESC, source_entity.name ASC, source_entity.entity_id ASC
+                RETURN collect(
+                    {
+                        relation_type: coalesce(rel.relation_type, "RELATED_TO"),
+                        entity_id: source_entity.entity_id,
+                        name: source_entity.name,
+                        evidence: rel.evidence
+                    }
+                )[..$relation_limit] AS incoming_relations
+            }
+            CALL {
+                WITH entity
+                MATCH (entity)-[mention:MENTIONED_IN]->(source:Source)
+                WITH source, coalesce(mention.relevance, $default_mentioned_in_relevance) AS relevance
+                ORDER BY relevance DESC, coalesce(source.title, "") DESC, source.canonical_url ASC
+                RETURN collect(
+                    {
+                        id: source.canonical_url,
+                        title: source.title,
+                        summary: source.summary,
+                        relevance: relevance
+                    }
+                )[..$source_limit] AS mentioned_in_sources
+            }
+            RETURN entity.entity_id AS entity_id,
+                   entity.name AS name,
+                   entity.normalized_name AS normalized_name,
+                   entity.category AS category,
+                   entity.summary AS summary,
+                   coalesce(entity.aliases, []) AS aliases,
+                   outgoing_relations,
+                   incoming_relations,
+                   mentioned_in_sources
+            LIMIT 1
+            """,
+            entity_id=entity_id.strip(),
+            source_limit=max(0, source_limit),
+            relation_limit=max(0, relation_limit),
+            default_mentioned_in_relevance=DEFAULT_MENTIONED_IN_RELEVANCE,
+        )
+        if not records:
+            return None
+        return records[0]
+
+    async def find_entities_exact(
+        self,
+        *,
+        name: str | None = None,
+        alias: str | None = None,
+        limit: int = 10,
+        source_limit: int = 10,
+        relation_limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        normalized_name = (name or "").strip() or None
+        normalized_alias = (alias or "").strip() or None
+        if normalized_name is None and normalized_alias is None:
+            return []
+        return await self._query_read_records(
+            "find_entities_exact",
+            """
+            MATCH (entity:Entity)
+            WHERE (
+                $name IS NOT NULL AND (
+                    toLower(trim(entity.name)) = toLower(trim($name))
+                    OR entity.normalized_name = toLower(trim($name))
+                )
+            ) OR (
+                $alias IS NOT NULL AND any(item IN coalesce(entity.aliases, []) WHERE toLower(trim(item)) = toLower(trim($alias)))
+            )
+            WITH entity
+            ORDER BY entity.name ASC
+            LIMIT $limit
+            CALL {
+                WITH entity
+                MATCH (entity)-[rel:RELATED_TO]->(target:Entity)
+                WITH rel, target
+                ORDER BY coalesce(rel.relevance, 0.0) DESC, target.name ASC, target.entity_id ASC
+                RETURN collect(
+                    {
+                        relation_type: coalesce(rel.relation_type, "RELATED_TO"),
+                        entity_id: target.entity_id,
+                        name: target.name,
+                        evidence: rel.evidence
+                    }
+                )[..$relation_limit] AS outgoing_relations
+            }
+            CALL {
+                WITH entity
+                MATCH (source_entity:Entity)-[rel:RELATED_TO]->(entity)
+                WITH rel, source_entity
+                ORDER BY coalesce(rel.relevance, 0.0) DESC, source_entity.name ASC, source_entity.entity_id ASC
+                RETURN collect(
+                    {
+                        relation_type: coalesce(rel.relation_type, "RELATED_TO"),
+                        entity_id: source_entity.entity_id,
+                        name: source_entity.name,
+                        evidence: rel.evidence
+                    }
+                )[..$relation_limit] AS incoming_relations
+            }
+            CALL {
+                WITH entity
+                MATCH (entity)-[mention:MENTIONED_IN]->(source:Source)
+                WITH source, coalesce(mention.relevance, $default_mentioned_in_relevance) AS relevance
+                ORDER BY relevance DESC, coalesce(source.title, "") DESC, source.canonical_url ASC
+                RETURN collect(
+                    {
+                        id: source.canonical_url,
+                        title: source.title,
+                        summary: source.summary,
+                        relevance: relevance
+                    }
+                )[..$source_limit] AS mentioned_in_sources
+            }
+            RETURN entity.entity_id AS entity_id,
+                   entity.name AS name,
+                   entity.normalized_name AS normalized_name,
+                   entity.category AS category,
+                   entity.summary AS summary,
+                   coalesce(entity.aliases, []) AS aliases,
+                   mentioned_in_sources,
+                   outgoing_relations,
+                   incoming_relations
+            """,
+            name=normalized_name,
+            alias=normalized_alias,
+            limit=limit,
+            source_limit=max(0, source_limit),
+            relation_limit=max(0, relation_limit),
+            default_mentioned_in_relevance=DEFAULT_MENTIONED_IN_RELEVANCE,
+        )
+
+    async def get_source_detail(self, canonical_url: str) -> dict[str, Any] | None:
+        if not self.enabled or not canonical_url.strip():
+            return None
+        candidate_urls = _build_source_lookup_variants(canonical_url)
+        records = await self._query_read_records(
+            "get_source_detail",
+            """
+            MATCH (source:Source)
+            WHERE source.canonical_url IN $candidate_urls
+            WITH source,
+                 (
+                    CASE WHEN source.fetched_at IS NULL THEN 0 ELSE 1 END
+                    + CASE WHEN coalesce(trim(source.title), '') <> '' THEN 1 ELSE 0 END
+                    + CASE WHEN coalesce(trim(source.summary), '') <> '' THEN 1 ELSE 0 END
+                    + CASE WHEN coalesce(trim(source.content_hash), '') <> '' THEN 1 ELSE 0 END
+                 ) AS completeness
+            ORDER BY completeness DESC,
+                     source.fetched_at DESC,
+                     size(coalesce(source.summary, '')) DESC,
+                     size(coalesce(source.title, '')) DESC,
+                     source.canonical_url ASC
+            RETURN source.canonical_url AS source_key,
+                   source.canonical_url AS canonical_url,
+                   source.title AS title,
+                   source.summary AS summary,
+                   source.fetched_at AS fetched_at,
+                   source.content_hash AS content_hash,
+                   [(entity:Entity)-[:MENTIONED_IN]->(source) |
+                       {entity_id: entity.entity_id, name: entity.name}
+                   ] AS mentioned_entities
+            LIMIT 1
+            """,
+            candidate_urls=candidate_urls,
+        )
+        if not records:
+            return None
+        return records[0]
+
+    async def get_source_metadata_map(self, source_keys: list[str]) -> dict[str, dict[str, Any]]:
+        normalized_source_keys = []
+        for source_key in source_keys:
+            candidate = str(source_key or "").strip()
+            if candidate and candidate not in normalized_source_keys:
+                normalized_source_keys.append(candidate)
+        if not self.enabled or not normalized_source_keys:
+            return {}
+        lookups = [
+            {
+                "requested_key": source_key,
+                "candidate_keys": _build_source_lookup_variants(source_key),
+            }
+            for source_key in normalized_source_keys
+        ]
+        records = await self._query_read_records(
+            "get_source_metadata_map",
+            """
+            UNWIND $lookups AS lookup
+            CALL (lookup) {
+                UNWIND lookup.candidate_keys AS candidate_key
+                MATCH (source:Source {canonical_url: candidate_key})
+                WITH source,
+                     (
+                        CASE WHEN source.fetched_at IS NULL THEN 0 ELSE 1 END
+                        + CASE WHEN coalesce(trim(source.title), '') <> '' THEN 1 ELSE 0 END
+                        + CASE WHEN coalesce(trim(source.summary), '') <> '' THEN 1 ELSE 0 END
+                        + CASE WHEN coalesce(trim(source.content_hash), '') <> '' THEN 1 ELSE 0 END
+                     ) AS completeness
+                ORDER BY completeness DESC,
+                         source.fetched_at DESC,
+                         size(coalesce(source.summary, '')) DESC,
+                         size(coalesce(source.title, '')) DESC,
+                         source.canonical_url ASC
+                RETURN source
+                LIMIT 1
+            }
+            RETURN lookup.requested_key AS source_key,
+                   source.canonical_url AS canonical_url,
+                   source.title AS title,
+                   source.summary AS summary
+            """,
+            lookups=lookups,
+        )
+        return {str(record["source_key"]): record for record in records}
 
     async def query_entity_context(
         self,
@@ -222,7 +477,7 @@ class Neo4jGraphRepository:
         query_embedding: list[float] | None = None,
         mode: str = "hybrid",
     ) -> list[dict[str, Any]]:
-        if not self.enabled or not query.strip():
+        if not self.enabled or (not query.strip() and query_embedding is None):
             return []
 
         keyword_matches: list[dict[str, Any]] = []
@@ -252,7 +507,9 @@ class Neo4jGraphRepository:
             )
 
         vector_matches: list[dict[str, Any]] = []
-        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled:
+        if mode in ("hybrid", "vector") and (
+            query_embedding is not None or (self._embedding_client and self._embedding_client.enabled)
+        ):
             await self.connect()
             async with self._driver.session() as session:
                 try:
@@ -363,9 +620,15 @@ class Neo4jGraphRepository:
         neighborhood_hops: int = 2,
         candidate_urls: list[str] | None = None,
         mode: str = "hybrid",
+        query_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
-        query_embedding: list[float] | None = None
-        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled and query.strip():
+        if (
+            query_embedding is None
+            and mode in ("hybrid", "vector")
+            and self._embedding_client
+            and self._embedding_client.enabled
+            and query.strip()
+        ):
             try:
                 query_embedding = await self._embedding_client.embed_text(query.strip())
             except Exception as exc:  # noqa: BLE001
@@ -426,10 +689,12 @@ class Neo4jGraphRepository:
         query_embedding: list[float] | None = None,
         mode: str = "hybrid",
     ) -> list[IndexQueryResult]:
-        if not self.enabled or not query.strip():
+        if not self.enabled or (not query.strip() and query_embedding is None):
             return []
         vector_results: list[IndexQueryResult] = []
-        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled:
+        if mode in ("hybrid", "vector") and (
+            query_embedding is not None or (self._embedding_client and self._embedding_client.enabled)
+        ):
             try:
                 await self.connect()
                 vector_input = query_embedding
@@ -476,10 +741,12 @@ class Neo4jGraphRepository:
         query_embedding: list[float] | None = None,
         mode: str = "hybrid",
     ) -> list[IndexQueryResult]:
-        if not self.enabled or not query.strip():
+        if not self.enabled or (not query.strip() and query_embedding is None):
             return []
         vector_results: list[IndexQueryResult] = []
-        if mode in ("hybrid", "vector") and self._embedding_client and self._embedding_client.enabled:
+        if mode in ("hybrid", "vector") and (
+            query_embedding is not None or (self._embedding_client and self._embedding_client.enabled)
+        ):
             try:
                 await self.connect()
                 vector_input = query_embedding
@@ -731,6 +998,7 @@ class Neo4jGraphRepository:
         job_id: str,
         extraction: PageExtraction,
     ) -> GraphUpdateResult:
+        extraction = _normalize_page_extraction_source_urls(extraction)
         update = GraphUpdateResult()
         entity_ids_to_refresh: set[str] = set()
         if not self.enabled:
@@ -743,6 +1011,10 @@ class Neo4jGraphRepository:
 
         try:
             async with self._driver.session() as session:
+                await session.execute_write(
+                    self._ensure_source_canonical_key_tx,
+                    extraction.canonical_url,
+                )
                 source_target_hash = _build_source_embedding_target_hash(
                     summary=extraction.summary,
                     version=self._settings.embedding_version,
@@ -1175,12 +1447,55 @@ class Neo4jGraphRepository:
         )
 
     @staticmethod
+    async def _ensure_source_canonical_key_tx(tx, canonical_url: str) -> None:
+        candidate_urls = _build_source_lookup_variants(canonical_url)
+        result = await tx.run(
+            """
+            MATCH (source:Source)
+            WHERE source.canonical_url IN $candidate_urls
+            WITH source,
+                 CASE WHEN source.canonical_url = $canonical_url THEN 1 ELSE 0 END AS exact_match,
+                 (
+                    CASE WHEN source.fetched_at IS NULL THEN 0 ELSE 1 END
+                    + CASE WHEN coalesce(trim(source.title), '') <> '' THEN 1 ELSE 0 END
+                    + CASE WHEN coalesce(trim(source.summary), '') <> '' THEN 1 ELSE 0 END
+                    + CASE WHEN coalesce(trim(source.content_hash), '') <> '' THEN 1 ELSE 0 END
+                 ) AS completeness
+            RETURN source.canonical_url AS existing_canonical_url
+            ORDER BY exact_match DESC,
+                     completeness DESC,
+                     source.fetched_at DESC,
+                     size(coalesce(source.summary, '')) DESC,
+                     size(coalesce(source.title, '')) DESC,
+                     source.canonical_url ASC
+            LIMIT 1
+            """,
+            candidate_urls=candidate_urls,
+            canonical_url=canonical_url,
+        )
+        record = await result.single()
+        if not record:
+            return
+        existing_canonical_url = str(record.get("existing_canonical_url") or "").strip()
+        if not existing_canonical_url or existing_canonical_url == canonical_url:
+            return
+        await tx.run(
+            """
+            MATCH (source:Source {canonical_url: $existing_canonical_url})
+            SET source.canonical_url = $canonical_url
+            """,
+            existing_canonical_url=existing_canonical_url,
+            canonical_url=canonical_url,
+        )
+
+    @staticmethod
     async def _upsert_source_tx(
         tx,
         job_id: str,
         extraction: PageExtraction,
         source_target_hash: str,
     ) -> None:
+        normalized_extraction = _normalize_page_extraction_source_urls(extraction)
         query = """
         MERGE (job:CrawlJob {job_id: $job_id})
         ON CREATE SET job.started_at = datetime(),
@@ -1209,22 +1524,23 @@ class Neo4jGraphRepository:
         await tx.run(
             query,
             job_id=job_id,
-            canonical_url=extraction.canonical_url,
-            title=extraction.title,
-            summary=extraction.summary,
-            content_hash=extraction.content_hash,
-            raw_text_excerpt=extraction.raw_text_excerpt,
+            canonical_url=normalized_extraction.canonical_url,
+            title=normalized_extraction.title,
+            summary=normalized_extraction.summary,
+            content_hash=normalized_extraction.content_hash,
+            raw_text_excerpt=normalized_extraction.raw_text_excerpt,
             source_target_hash=source_target_hash,
         )
 
-        for discovered_url in extraction.discovered_urls:
+        for discovered_url in normalized_extraction.discovered_urls:
+            await Neo4jGraphRepository._ensure_source_canonical_key_tx(tx, discovered_url)
             await tx.run(
                 """
                 MERGE (origin:Source {canonical_url: $source_url})
                 MERGE (target:Source {canonical_url: $target_url})
                 MERGE (origin)-[:LINKS_TO]->(target)
                 """,
-                source_url=extraction.canonical_url,
+                source_url=normalized_extraction.canonical_url,
                 target_url=discovered_url,
             )
 
@@ -2545,6 +2861,116 @@ def _build_related_url_lookup_terms(url: str) -> list[str]:
     return cleaned_candidates
 
 
+def _build_source_lookup_variants(url: str) -> list[str]:
+    candidate = str(url or "").strip()
+    if not candidate:
+        return []
+
+    normalized_candidate = _normalize_source_storage_url(candidate)
+    parsed = urlsplit(candidate)
+    if not parsed.netloc:
+        return [normalized_candidate] if normalized_candidate else [candidate]
+
+    scheme = parsed.scheme.lower() or "https"
+    hosts = _build_source_lookup_hosts(parsed.netloc.lower())
+    path_variants = _build_source_lookup_paths(parsed.path or "/")
+    query = parsed.query
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for host in hosts:
+        for path in path_variants:
+            variant = urlunsplit((scheme, host, path, query, ""))
+            if variant in seen:
+                continue
+            seen.add(variant)
+            variants.append(variant)
+    if normalized_candidate and normalized_candidate not in seen:
+        variants.insert(0, normalized_candidate)
+        seen.add(normalized_candidate)
+    if candidate not in seen:
+        variants.insert(0, candidate)
+    return variants
+
+
+def _normalize_page_extraction_source_urls(extraction: PageExtraction) -> PageExtraction:
+    normalized_canonical_url = _normalize_source_storage_url(extraction.canonical_url)
+    normalized_discovered_urls = _normalize_source_url_list(extraction.discovered_urls)
+    return extraction.model_copy(
+        update={
+            "canonical_url": normalized_canonical_url,
+            "discovered_urls": normalized_discovered_urls,
+        }
+    )
+
+
+def _normalize_source_url_list(urls: list[str]) -> list[str]:
+    normalized_urls: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        normalized = _normalize_source_storage_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_urls.append(normalized)
+    return normalized_urls
+
+
+def _normalize_source_storage_url(url: str) -> str:
+    candidate = str(url or "").strip()
+    if not candidate:
+        return ""
+    parsed = urlsplit(candidate)
+    if not parsed.netloc:
+        return candidate
+
+    scheme = parsed.scheme.lower() or "https"
+    host = parsed.netloc.lower()
+    path = _build_source_lookup_paths(parsed.path or "/")[-1]
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith(_SOURCE_TRACKING_QUERY_PREFIXES)
+        ],
+        doseq=True,
+    )
+    return urlunsplit((scheme, host, path, query, ""))
+
+
+def _build_source_lookup_hosts(host: str) -> list[str]:
+    return [host]
+
+
+def _build_source_lookup_paths(path: str) -> list[str]:
+    normalized_path = path or "/"
+    if normalized_path != "/" and normalized_path.endswith("/"):
+        normalized_path = normalized_path.rstrip("/")
+    decoded_path = _decode_url_value(normalized_path) or "/"
+    encoded_path = quote(decoded_path, safe="/%:@!$&'()*+,;=-._~") or "/"
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for item in (normalized_path, decoded_path, encoded_path):
+        if item in seen:
+            continue
+        seen.add(item)
+        variants.append(item)
+    return variants
+
+
+def _decode_url_value(value: str) -> str:
+    decoded = str(value or "").strip()
+    for _ in range(3):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded
+
+
 def _is_entity_like_lookup_term(term: str) -> bool:
     normalized = _normalize_lookup_term(term)
     if not normalized or len(normalized) < 2:
@@ -3113,6 +3539,9 @@ _SOURCE_VECTOR_QUERY_CYPHER = """
 CALL db.index.vector.queryNodes($index_name, $limit, $query_embedding)
 YIELD node, score
 WHERE node:Source
+    AND node.fetched_at IS NOT NULL
+    AND coalesce(trim(node.title), '') <> ''
+    AND coalesce(trim(node.summary), '') <> ''
 RETURN node.canonical_url AS source_key,
        node.title AS title,
        node.summary AS summary,
@@ -3129,7 +3558,6 @@ RETURN node.source_key AS source_key,
        node.left_entity_id AS left_entity_id,
        node.right_entity_id AS right_entity_id,
        node.aggregated_text AS aggregated_text,
-       node['score'] AS stored_score,
        node.embedding_updated_at AS embedding_updated_at,
        node.content_hash AS content_hash,
        score,
@@ -3166,6 +3594,9 @@ _SOURCE_FULLTEXT_QUERY_CYPHER = """
 CALL db.index.fulltext.queryNodes($index_name, $query, {limit: $limit})
 YIELD node, score
 WHERE node:Source
+    AND node.fetched_at IS NOT NULL
+    AND coalesce(trim(node.title), '') <> ''
+    AND coalesce(trim(node.summary), '') <> ''
 RETURN node.canonical_url AS source_key,
        node.title AS title,
        node.summary AS summary,
@@ -3249,6 +3680,9 @@ LIMIT $limit
 _SOURCE_EMBEDDING_CANDIDATES_CYPHER = """
 MATCH (source:Source)
 WHERE NOT source.canonical_url IN $exclude_keys
+    AND source.fetched_at IS NOT NULL
+    AND coalesce(trim(source.title), '') <> ''
+    AND coalesce(trim(source.summary), '') <> ''
 RETURN source.canonical_url AS canonical_url,
        source.summary AS summary,
        properties(source)['embedding_target_hash'] AS embedding_target_hash,
@@ -3308,6 +3742,9 @@ LIMIT $limit
 _SOURCE_FULLTEXT_CANDIDATES_CYPHER = """
 MATCH (source:Source)
 WHERE NOT source.canonical_url IN $exclude_keys
+    AND source.fetched_at IS NOT NULL
+    AND coalesce(trim(source.title), '') <> ''
+    AND coalesce(trim(source.summary), '') <> ''
 RETURN source.canonical_url AS canonical_url,
        source.title AS title,
        source.summary AS summary,

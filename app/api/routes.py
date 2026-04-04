@@ -20,9 +20,25 @@ from app.models import (
     JobStatus,
     LLMProfile,
     Neo4jProfile,
+    SearchApiCapabilitiesResponse,
+    SearchApiSettingsUpdateRequest,
+    SearchEntityQueryRequest,
+    SearchEntityQueryResponse,
+    SearchPermissionSource,
+    SearchPermissionSourceCreateRequest,
+    SearchPermissionSourceCreateResponse,
+    SearchPermissionSourceUpdateRequest,
+    SearchQueryRequest,
+    SearchQueryResponse,
+    SearchSourceByKeyRequest,
+    SearchSourceDetailResponse,
     SearchPreviewRequest,
     SearchPreviewResponse,
     RuntimeStatusResponse
+)
+from app.services.search_api import (
+    build_permission_source_from_create_request,
+    build_permission_source_from_update_request,
 )
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -30,6 +46,14 @@ router = APIRouter(prefix="/api", tags=["api"])
 
 def _container(request: Request):
     return request.app.state.container
+
+
+def _find_search_permission_source(request: Request, source_id: str) -> SearchPermissionSource:
+    config = _container(request).config_service.get_config()
+    for source in config.search_api.permission_sources:
+        if source.id == source_id:
+            return source
+    raise HTTPException(status_code=404, detail="Permission source not found")
 
 
 @router.get("/auth/status")
@@ -62,7 +86,7 @@ async def logout(request: Request, response: Response) -> AuthStatusResponse:
     )
 
 @router.get("/status", tags=["health"])
-async def status(request: Request) -> RuntimeStatusResponse:
+async def runtime_status(request: Request) -> RuntimeStatusResponse:
     return await request.app.state.container.runtime_status.get_status()
 
 @router.post("/jobs")
@@ -215,6 +239,62 @@ async def query_index_preview(
     return await container.indexing.query_preview(payload)
 
 
+@router.get(
+    "/search/v1/capabilities",
+    tags=["search"],
+    response_model=SearchApiCapabilitiesResponse,
+    summary="Get current search API capabilities",
+)
+async def get_search_api_capabilities(request: Request) -> SearchApiCapabilitiesResponse:
+    container = _container(request)
+    return await container.search_api.get_capabilities(request)
+
+
+@router.post(
+    "/search/v1/entities/query",
+    tags=["search"],
+    response_model=SearchEntityQueryResponse,
+    summary="Query entities by entity_id, exact name, or exact alias",
+)
+async def query_search_entities(
+    request: Request,
+    payload: SearchEntityQueryRequest,
+) -> SearchEntityQueryResponse:
+    container = _container(request)
+    await container.search_api.authorize_request(request)
+    return await container.search_api.query_entities(payload)
+
+
+@router.post(
+    "/search/v1/sources/query",
+    tags=["search"],
+    response_model=SearchSourceDetailResponse,
+    summary="Get a source by source_key",
+)
+async def get_search_source(
+    request: Request,
+    payload: SearchSourceByKeyRequest,
+) -> SearchSourceDetailResponse:
+    container = _container(request)
+    await container.search_api.authorize_request(request)
+    return await container.search_api.get_source_detail(payload)
+
+
+@router.post(
+    "/search/v1/search",
+    tags=["search"],
+    response_model=SearchQueryResponse,
+    summary="Execute a unified search query",
+)
+async def query_search_api(
+    request: Request,
+    payload: SearchQueryRequest,
+) -> SearchQueryResponse:
+    container = _container(request)
+    access = await container.search_api.authorize_request(request)
+    return await container.search_api.query(payload, access)
+
+
 @router.get("/config")
 async def get_config(request: Request) -> AppConfig:
     container = _container(request)
@@ -240,6 +320,68 @@ async def reload_config(request: Request) -> ConfigSummaryResponse:
     container = _container(request)
     await container.reload_runtime()
     return ConfigSummaryResponse.model_validate(container.config_service.get_summary())
+
+
+@router.put("/config/search-api/settings")
+async def update_search_api_settings(
+    request: Request,
+    payload: SearchApiSettingsUpdateRequest,
+) -> AppConfig:
+    container = _container(request)
+    container.config_service.update_search_api_settings(
+        enabled=payload.enabled,
+        validation_enabled=payload.validation_enabled,
+    )
+    await container.reload_search_api_config()
+    return container.config_service.get_config()
+
+
+@router.post("/config/search-api/permissions")
+async def create_search_permission_source(
+    request: Request,
+    payload: SearchPermissionSourceCreateRequest,
+) -> SearchPermissionSourceCreateResponse:
+    container = _container(request)
+    permission_source, generated_api_key = build_permission_source_from_create_request(payload)
+    try:
+        container.config_service.create_search_permission_source(permission_source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await container.reload_search_api_config()
+    return SearchPermissionSourceCreateResponse(
+        permission_source=permission_source,
+        generated_api_key=generated_api_key,
+    )
+
+
+@router.put("/config/search-api/permissions/{source_id}")
+async def update_search_permission_source(
+    request: Request,
+    source_id: str,
+    payload: SearchPermissionSourceUpdateRequest,
+) -> SearchPermissionSource:
+    container = _container(request)
+    existing = _find_search_permission_source(request, source_id)
+    updated_source = build_permission_source_from_update_request(existing, payload)
+    try:
+        container.config_service.update_search_permission_source(source_id, updated_source)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Permission source not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await container.reload_search_api_config()
+    return updated_source
+
+
+@router.delete("/config/search-api/permissions/{source_id}")
+async def delete_search_permission_source(request: Request, source_id: str) -> AppConfig:
+    container = _container(request)
+    try:
+        container.config_service.delete_search_permission_source(source_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Permission source not found") from exc
+    await container.reload_search_api_config()
+    return container.config_service.get_config()
 
 
 @router.get("/config/data-sources")

@@ -4,6 +4,7 @@ from typing import Any
 
 from app.models import PageExtraction
 from app.repos.graph_repo import Neo4jGraphRepository
+from app.services.crawl.canonicalizer import URLCanonicalizer
 from app.services.crawl.discovery import LinkDiscoveryService
 from app.services.crawl.extractor import ContentExtractor
 from app.services.crawl.fetcher import HttpFetcher
@@ -29,19 +30,22 @@ class FetchUrlTool(BaseTool):
         fetcher: HttpFetcher,
         extractor: ContentExtractor,
         discovery: LinkDiscoveryService,
+        canonicalizer: URLCanonicalizer,
     ) -> None:
         self._fetcher = fetcher
         self._extractor = extractor
         self._discovery = discovery
+        self._canonicalizer = canonicalizer
 
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         url = kwargs["url"]
         referer = kwargs.get("referer")
         final_url, status_code, html, fetch_mode = await self._fetcher.fetch(url, referer=referer)
-        links = self._discovery.discover(html, final_url)
+        canonical_url = self._canonicalizer.canonicalize(final_url)
+        links = self._discovery.discover(html, canonical_url)
         page = self._extractor.extract(
             url=url,
-            canonical_url=final_url,
+            canonical_url=canonical_url,
             status_code=status_code,
             fetch_mode=fetch_mode,
             html=html,

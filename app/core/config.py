@@ -23,7 +23,7 @@ class _SettingsFields(BaseModel):
         default="",
         alias="OPENAI_EMBEDDING_MODEL",
     )
-    knowledge_theme: str = Field(default="", alias="KNOWLEDGE_THEME")
+    knowledge_theme: str = ""
     embedding_dimensions: int = Field(default=1536, alias="EMBEDDING_DIMENSIONS", ge=1)
     embedding_batch_size: int = Field(default=16, alias="EMBEDDING_BATCH_SIZE", ge=1)
     embedding_text_max_chars: int = Field(default=4000, alias="EMBEDDING_TEXT_MAX_CHARS", ge=1)
@@ -77,7 +77,7 @@ class Settings(_SettingsFields):
             openai_embedding_base_url=embedding.base_url if embedding else "",
             openai_embedding_api_key=embedding.api_key if embedding else "",
             openai_embedding_model=embedding.model if embedding else "",
-            knowledge_theme=runtime.knowledge_theme,
+            knowledge_theme=neo4j.knowledge_theme if neo4j else "",
             embedding_dimensions=runtime.embedding_dimensions,
             embedding_batch_size=runtime.embedding_batch_size,
             embedding_text_max_chars=runtime.embedding_text_max_chars,
@@ -110,6 +110,8 @@ class Settings(_SettingsFields):
 class BootstrapSettings(BaseSettings):
     model_config = SettingsConfigDict(
         case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
     )

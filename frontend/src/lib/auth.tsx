@@ -46,6 +46,18 @@ export function notifyAuthRequired() {
   window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT))
 }
 
+export async function fetchAuthStatus(): Promise<AuthStatus | null> {
+  try {
+    const response = await fetch('/api/auth/status', { credentials: 'same-origin' })
+    if (!response.ok) {
+      throw new Error(`Failed to load auth status: ${response.status}`)
+    }
+    return (await response.json()) as AuthStatus
+  } catch {
+    return null
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -61,13 +73,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   })
 
   const loadStatus = useEffectEvent(async () => {
-    try {
-      const response = await fetch('/api/auth/status', { credentials: 'same-origin' })
-      if (!response.ok) {
-        throw new Error(`Failed to load auth status: ${response.status}`)
-      }
-      applyStatus(await response.json())
-    } catch {
+    const status = await fetchAuthStatus()
+    if (status) {
+      applyStatus(status)
+    } else {
       startTransition(() => {
         setBypassEnabled(false)
         setAuthenticated(false)

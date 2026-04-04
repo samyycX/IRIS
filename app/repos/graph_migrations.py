@@ -11,6 +11,7 @@ from neo4j.exceptions import Neo4jError
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.models import utcnow
+from app.repos.neo4j_driver import NEO4J_DRIVER_CONFIG
 
 logger = get_logger(__name__)
 
@@ -41,6 +42,7 @@ class Neo4jMigrationManager:
         self._driver = AsyncGraphDatabase.driver(
             self._settings.neo4j_uri,
             auth=(self._settings.neo4j_username, self._settings.neo4j_password),
+            **NEO4J_DRIVER_CONFIG,
         )
 
     async def close(self) -> None:

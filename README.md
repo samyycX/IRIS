@@ -50,6 +50,8 @@ IRIS_PASSWORD_BYPASS=true
 
 如果两者都没有设置，后端会在启动时直接报错：`IRIS_PASSWORD OR IRIS_PASSWORD_BYPASS not set`。
 
+`BootstrapSettings` 会同时读取进程环境变量和工作目录下的 `.env`；如果两边都配置了同名项，进程环境变量优先。
+
 当设置了 `IRIS_PASSWORD` 时，前端需要先输入密码，验证通过后才会访问 `/api/*` 和 `/status`。后端会使用 Argon2id 对启动时读取到的密码做内存哈希，并通过同源 HttpOnly Cookie 维持登录态。
 
 默认情况下，应用使用进程内后台任务执行器，已访问 URL 会以 JSON 结构持久化到 `VISITED_URLS_FILE` 指定的位置，并记录最近访问时间，无需 Redis。历史 URL 默认只会在 `10` 天内跳过；超过这个时间会允许重新抓取。这个窗口可通过 `.env` 中的 `VISITED_URL_TTL_DAYS` 调整。
@@ -96,13 +98,19 @@ AUTO_BACKFILL_INDEXES_AFTER_CRAWL=true
 
 LLM 现在统一使用一套 prompt，不再通过 `PROMPT_PROFILE` 切换。
 
-如果希望采集器只保留某个主题下的页面，可以在 `.env` 中配置：
+如果希望采集器只保留某个主题下的页面，需要在对应的 Neo4j profile 上配置 `knowledge_theme`。可以通过前端配置页设置，或直接编辑 `data/config/app_config.json`：
 
-```bash
-KNOWLEDGE_THEME=鸣潮角色、剧情、组织与世界观
+```json
+{
+	"id": "local-neo4j",
+	"uri": "neo4j://127.0.0.1:7687",
+	"username": "neo4j",
+	"password": "secret",
+	"knowledge_theme": "鸣潮角色、剧情、组织与世界观"
+}
 ```
 
-当 `KNOWLEDGE_THEME` 非空时，采集器会先判断页面是否与该主题相关；不相关的页面不会写入数据库，也不会抽取任何实体或关系。
+当当前激活的 Neo4j profile 的 `knowledge_theme` 非空时，采集器会先判断页面是否与该主题相关；不相关的页面不会写入数据库，也不会抽取任何实体或关系。不同 Neo4j profile 可以配置不同主题。
 
 ## 动态页面抓取
 

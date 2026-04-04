@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from enum import Enum
+from ipaddress import ip_network
 from typing import TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
-APP_CONFIG_SCHEMA_VERSION = 1
+APP_CONFIG_SCHEMA_VERSION = 3
 
 
 class DataSourceKind(str, Enum):
@@ -22,6 +23,7 @@ class Neo4jProfile(BaseProfile):
     uri: str = ""
     username: str = ""
     password: str = ""
+    knowledge_theme: str = ""
 
 
 class LLMProfile(BaseProfile):
@@ -36,8 +38,44 @@ class EmbeddingProfile(BaseProfile):
     model: str = ""
 
 
+class SearchPermissionSourceKind(str, Enum):
+    api_key = "api_key"
+    ip = "ip"
+
+
+class SearchPermissionSource(BaseModel):
+    id: str
+    kind: SearchPermissionSourceKind
+    description: str = ""
+    enabled: bool = True
+    allow_builtin_embedding: bool = False
+    api_key_hash: str | None = None
+    key_prefix: str | None = None
+    ip_value: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_source_payload(self) -> "SearchPermissionSource":
+        self.id = self.id.strip()
+        if not self.id:
+            raise ValueError("Search API permission source id must not be empty")
+        if self.kind == SearchPermissionSourceKind.api_key:
+            if not self.api_key_hash:
+                raise ValueError("API key permission source requires api_key_hash")
+            return self
+
+        if not self.ip_value:
+            raise ValueError("IP permission source requires ip_value")
+        ip_network(self.ip_value, strict=False)
+        return self
+
+
+class SearchApiConfig(BaseModel):
+    enabled: bool = False
+    validation_enabled: bool = True
+    permission_sources: list[SearchPermissionSource] = Field(default_factory=list)
+
+
 class RuntimeConfig(BaseModel):
-    knowledge_theme: str = ""
     embedding_dimensions: int = Field(default=1536, ge=1)
     embedding_batch_size: int = Field(default=16, ge=1)
     embedding_text_max_chars: int = Field(default=4000, ge=1)
@@ -70,12 +108,16 @@ class AppConfig(BaseModel):
     embedding_profiles: list[EmbeddingProfile] = Field(default_factory=list)
     active_embedding_profile_id: str | None = None
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    search_api: SearchApiConfig = Field(default_factory=SearchApiConfig)
 
     @model_validator(mode="after")
     def _validate_active_profiles(self) -> "AppConfig":
         _require_profiles("neo4j_profiles", self.neo4j_profiles, self.active_neo4j_profile_id)
         _require_profiles("llm_profiles", self.llm_profiles, self.active_llm_profile_id)
         _require_profiles("embedding_profiles", self.embedding_profiles, self.active_embedding_profile_id)
+        permission_source_ids = [source.id for source in self.search_api.permission_sources]
+        if len(permission_source_ids) != len(set(permission_source_ids)):
+            raise ValueError("Search API permission source ids must be unique")
         return self
 
     def get_active_neo4j_profile(self) -> Neo4jProfile | None:
@@ -86,6 +128,12 @@ class AppConfig(BaseModel):
 
     def get_active_embedding_profile(self) -> EmbeddingProfile | None:
         return _get_active_profile(self.embedding_profiles, self.active_embedding_profile_id)
+
+    def get_active_knowledge_theme(self) -> str:
+        active_profile = self.get_active_neo4j_profile()
+        if active_profile is None:
+            return ""
+        return active_profile.knowledge_theme
 
 
 class ActiveProfilesResponse(BaseModel):
@@ -100,6 +148,8 @@ class ConfigSummaryResponse(BaseModel):
     active_profiles: ActiveProfilesResponse
     knowledge_theme: str
     allowed_domains: list[str]
+    search_api_enabled: bool
+    search_api_validation_enabled: bool
 
 
 def _require_profiles(

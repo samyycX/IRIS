@@ -12,7 +12,7 @@
 
 ## 1. 项目一句话说明
 
-这是一个面向通用知识图谱构建的 Python 单体应用。它支持从 URL、文本指令或实体名发起任务，自动抓取网页、抽取正文、调用 OpenAI 兼容 LLM 生成结构化知识，并把页面、实体、关系写入 Neo4j，同时把任务状态、事件流、checkpoint 和图谱更新摘要持久化到 Neo4j `CrawlJob`。当前提示词已统一为单一版本，可通过 `KNOWLEDGE_THEME` 控制采集时只保留和指定主题相关的页面。
+这是一个面向通用知识图谱构建的 Python 单体应用。它支持从 URL、文本指令或实体名发起任务，自动抓取网页、抽取正文、调用 OpenAI 兼容 LLM 生成结构化知识，并把页面、实体、关系写入 Neo4j，同时把任务状态、事件流、checkpoint 和图谱更新摘要持久化到 Neo4j `CrawlJob`。当前提示词已统一为单一版本，可通过每个 Neo4j profile 独立配置的 `knowledge_theme` 控制采集时只保留和指定主题相关的页面。
 
 ---
 
@@ -193,7 +193,7 @@
 
 - 统一配置模型 `Settings`。
 - 负责把环境变量解析成强类型对象。
-- 包含 `APP_NAME`、`KNOWLEDGE_THEME` 等运行时配置入口。
+- 包含 `APP_NAME` 等运行时配置入口；当前生效的 `knowledge_theme` 来自 active Neo4j profile。
 - 包含 `AUTO_BACKFILL_INDEXES_AFTER_CRAWL`，用于控制 URL 采集任务完成后是否自动发起索引补全。
 - `allowed_domains` 支持逗号分隔字符串自动拆分。
 - `get_settings()` 用 `lru_cache` 做单例缓存。
@@ -269,6 +269,7 @@
 - 使用 Vite 构建，Shadcn UI 和 Tailwind CSS 驱动界面。
 - 启动 `npm run build` 后，产物放在 `frontend/dist` 供 FastAPI 托管。
 - 提供首页和任务实时日志详情页，支持国际化（i18n）与深色主题。
+- 系统配置页可为每个 Neo4j profile 单独配置 `knowledge_theme`，切换 active 数据库时会一起切换主题。
 
 ---
 
@@ -406,7 +407,7 @@
 #### `app/services/llm/prompts.py`
 
 - 当前 GraphRAG 结构化抽取和链接评分的统一系统提示词定义。
-- 支持通过 `KNOWLEDGE_THEME` 做页面级主题过滤；当页面与主题无关时，会直接跳过入库和信息抽取。
+- 支持通过当前 active Neo4j profile 的 `knowledge_theme` 做页面级主题过滤；当页面与主题无关时，会直接跳过入库和信息抽取。
 - 约束 LangChain structured output 的语义结构，包含页面相关性、页面摘要、实体关系和候选链接排序结果。
 
 #### `app/services/llm/client.py`

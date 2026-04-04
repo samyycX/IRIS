@@ -16,7 +16,7 @@
 - 每次 reload 完成后，后端会立即重测 Neo4j、LLM、Embedding 的运行状态，并刷新状态快照。
 - 后端不会后台轮询这些依赖；状态只会在初始化、调用 `/api/status`、以及配置 reload 时更新。
 - Prompt 使用后端内置默认值，当前不提供自定义接口。
-- 当前前端最核心需要配置的文本项是 `runtime.knowledge_theme`。
+- 当前前端最核心需要配置的文本项是每个 `neo4j_profile.knowledge_theme`。
 - Playwright 和无头浏览器默认开启，不再作为可配置项暴露。
 
 ## 配置结构
@@ -25,13 +25,14 @@
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "neo4j_profiles": [
     {
       "id": "local-neo4j",
       "uri": "neo4j://127.0.0.1:7687",
       "username": "neo4j",
-      "password": "secret"
+      "password": "secret",
+      "knowledge_theme": "鸣潮角色、剧情、组织与世界观"
     }
   ],
   "active_neo4j_profile_id": "local-neo4j",
@@ -53,8 +54,33 @@
     }
   ],
   "active_embedding_profile_id": "embedding-main",
+  "search_api": {
+    "enabled": true,
+    "validation_enabled": true,
+    "permission_sources": [
+      {
+        "id": "partner-alpha",
+        "kind": "api_key",
+        "description": "第三方系统调用",
+        "enabled": true,
+        "allow_builtin_embedding": false,
+        "api_key_hash": "<sha256>",
+        "key_prefix": "iris_sk_abcd",
+        "ip_value": null
+      },
+      {
+        "id": "office-network",
+        "kind": "ip",
+        "description": "办公网段",
+        "enabled": true,
+        "allow_builtin_embedding": true,
+        "api_key_hash": null,
+        "key_prefix": null,
+        "ip_value": "10.0.0.0/24"
+      }
+    ]
+  },
   "runtime": {
-    "knowledge_theme": "",
     "embedding_dimensions": 1536,
     "embedding_batch_size": 16,
     "embedding_text_max_chars": 4000,
@@ -80,6 +106,13 @@
 }
 ```
 
+`search_api` 字段说明：
+
+- `enabled`: 是否开放对外搜索 API。
+- `validation_enabled`: 是否启用独立权限校验。
+- `permission_sources`: 统一权限源列表，`kind` 取值为 `api_key` 或 `ip`。
+- `allow_builtin_embedding`: 是否允许该权限源直接调用服务端内置 Embedding。若为 `false`，向量/混合搜索必须显式传入 `query_vector`。
+
 ## 接口列表
 
 ### 1. 读取完整配置
@@ -102,15 +135,17 @@
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "data_root": "E:/programming/IRIS/data",
   "active_profiles": {
     "neo4j": "local-neo4j",
     "llm": "gemini-main",
     "embedding": "embedding-main"
   },
-  "knowledge_theme": "",
-  "allowed_domains": []
+  "knowledge_theme": "鸣潮角色、剧情、组织与世界观",
+  "allowed_domains": [],
+  "search_api_enabled": true,
+  "search_api_validation_enabled": true
 }
 ```
 
@@ -176,6 +211,69 @@
 - 用途：返回当前 Neo4j、LLM、Embedding 的健康状态，以及当前图谱中的 Entity、Source、RELATED_TO 计数。
 - 行为：每次请求都会即时刷新一次状态快照；当 Neo4j 当前不可用但此前拿到过统计时，会保留最近一次成功统计并标记 `graph.stale=true`。
 
+### 12. 更新搜索 API 设置
+
+- 方法：`PUT /api/config/search-api/settings`
+- 用途：切换 `search_api.enabled` 与 `search_api.validation_enabled`。
+- 行为：保存后自动 reload。
+
+请求示例：
+
+```json
+{
+  "enabled": true,
+  "validation_enabled": true
+}
+```
+
+### 13. 创建搜索 API 权限源
+
+- 方法：`POST /api/config/search-api/permissions`
+- 用途：新增统一权限源。
+- 支持类型：
+  - `api_key`: 服务端自动生成明文密钥，只在响应中返回一次。
+  - `ip`: 保存 IP 或 CIDR 白名单。
+
+请求示例：
+
+```json
+{
+  "id": "partner-alpha",
+  "kind": "api_key",
+  "description": "第三方系统调用",
+  "enabled": true,
+  "allow_builtin_embedding": false
+}
+```
+
+响应示例：
+
+```json
+{
+  "permission_source": {
+    "id": "partner-alpha",
+    "kind": "api_key",
+    "description": "第三方系统调用",
+    "enabled": true,
+    "allow_builtin_embedding": false,
+    "api_key_hash": "<sha256>",
+    "key_prefix": "iris_sk_abcd",
+    "ip_value": null
+  },
+  "generated_api_key": "iris_sk_xxxxxxxxxxxxxxxxxxxxxxxxx"
+}
+```
+
+### 14. 更新搜索 API 权限源
+
+- 方法：`PUT /api/config/search-api/permissions/{source_id}`
+- 用途：修改权限源的启用状态、描述、`allow_builtin_embedding`，以及 IP 类型权限源的 `ip_value`。
+
+### 15. 删除搜索 API 权限源
+
+- 方法：`DELETE /api/config/search-api/permissions/{source_id}`
+- 用途：删除指定权限源。
+
 响应示例：
 
 ```json
@@ -230,13 +328,18 @@
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "neo4j_profiles": [],
   "active_neo4j_profile_id": null,
   "llm_profiles": [],
   "active_llm_profile_id": null,
   "embedding_profiles": [],
   "active_embedding_profile_id": null,
+  "search_api": {
+    "enabled": false,
+    "validation_enabled": true,
+    "permission_sources": []
+  },
   "runtime": { "...": "使用后端默认值" }
 }
 ```
@@ -245,7 +348,7 @@
 
 1. 创建 Neo4j / LLM / Embedding 数据源。
 2. 选择 active profile。
-3. 至少设置 `runtime.knowledge_theme`。
+3. 至少为要使用的 Neo4j profile 设置 `knowledge_theme`。
 4. 按需调整其他 runtime 参数。
 5. 保存后调用摘要接口确认当前生效状态。
 

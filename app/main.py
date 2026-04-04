@@ -27,9 +27,15 @@ _AUTH_EXEMPT_PATHS = {
     "/api/auth/logout",
 }
 
+_AUTH_EXEMPT_PREFIXES = (
+    "/api/search/v1",
+)
+
 
 def _requires_auth(path: str) -> bool:
     if path in _AUTH_EXEMPT_PATHS:
+        return False
+    if any(path == prefix or path.startswith(f"{prefix}/") for prefix in _AUTH_EXEMPT_PREFIXES):
         return False
     return path == "/status" or path.startswith("/api/")
 

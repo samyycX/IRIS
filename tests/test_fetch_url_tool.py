@@ -1,6 +1,7 @@
 import pytest
 
 from app.models import CrawlPageResult
+from app.services.crawl.canonicalizer import URLCanonicalizer
 from app.services.tools.builtins import FetchUrlTool
 
 
@@ -38,7 +39,11 @@ class FakeExtractor:
 
 
 class FakeDiscovery:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
     def discover(self, html: str, base_url: str) -> list[str]:
+        self.calls.append((html, base_url))
         return [f"{base_url}/story"]
 
 
@@ -46,7 +51,8 @@ class FakeDiscovery:
 async def test_fetch_url_tool_passes_referer_and_fetch_mode():
     fetcher = FakeFetcher()
     extractor = FakeExtractor()
-    tool = FetchUrlTool(fetcher, extractor, FakeDiscovery())
+    discovery = FakeDiscovery()
+    tool = FetchUrlTool(fetcher, extractor, discovery, URLCanonicalizer())
 
     result = await tool.execute(
         url="https://wiki.example.com/character/role-alpha",
@@ -58,5 +64,12 @@ async def test_fetch_url_tool_passes_referer_and_fetch_mode():
     ]
     assert extractor.last_kwargs is not None
     assert extractor.last_kwargs["fetch_mode"] == "browser"
+    assert extractor.last_kwargs["canonical_url"] == "https://wiki.example.com/character/role-alpha"
     assert result["fetch_mode"] == "browser"
     assert result["links"] == ["https://wiki.example.com/character/role-alpha/story"]
+    assert discovery.calls == [
+        (
+            "<html><head><title>角色甲</title></head><body>正文</body></html>",
+            "https://wiki.example.com/character/role-alpha",
+        )
+    ]

@@ -12,8 +12,11 @@ from app.models.config import (
     LLMProfile,
     Neo4jProfile,
     RuntimeConfig,
+    SearchApiConfig,
+    SearchPermissionSource,
 )
 from app.services.local_data import LocalDataStore
+from app.services.search_api import normalize_permission_source_ids
 
 _CONFIG_PATH = ("config", "app_config.json")
 
@@ -106,9 +109,62 @@ class AppConfigService:
                 "llm": config.active_llm_profile_id,
                 "embedding": config.active_embedding_profile_id,
             },
-            "knowledge_theme": config.runtime.knowledge_theme,
+            "knowledge_theme": config.get_active_knowledge_theme(),
             "allowed_domains": config.runtime.allowed_domains,
+            "search_api_enabled": config.search_api.enabled,
+            "search_api_validation_enabled": config.search_api.validation_enabled,
         }
+
+    def update_search_api_settings(
+        self,
+        *,
+        enabled: bool,
+        validation_enabled: bool,
+    ) -> AppConfig:
+        config = self.get_config()
+        config.search_api.enabled = enabled
+        config.search_api.validation_enabled = validation_enabled
+        return self.save_config(config)
+
+    def create_search_permission_source(
+        self,
+        source: SearchPermissionSource,
+    ) -> AppConfig:
+        config = self.get_config()
+        config.search_api.permission_sources = list(
+            normalize_permission_source_ids(config.search_api.permission_sources)
+        )
+        if any(item.id == source.id for item in config.search_api.permission_sources):
+            raise ValueError(f"search_api permission source '{source.id}' already exists")
+        config.search_api.permission_sources.append(source)
+        return self.save_config(config)
+
+    def update_search_permission_source(
+        self,
+        source_id: str,
+        source: SearchPermissionSource,
+    ) -> AppConfig:
+        config = self.get_config()
+        sources = list(normalize_permission_source_ids(config.search_api.permission_sources))
+        config.search_api.permission_sources = sources
+        for index, current in enumerate(sources):
+            if current.id != source_id:
+                continue
+            if source.id != source_id and any(item.id == source.id for item in sources):
+                raise ValueError(f"search_api permission source '{source.id}' already exists")
+            sources[index] = source
+            return self.save_config(config)
+        raise KeyError(source_id)
+
+    def delete_search_permission_source(self, source_id: str) -> AppConfig:
+        config = self.get_config()
+        updated_sources = [
+            source for source in config.search_api.permission_sources if source.id != source_id
+        ]
+        if len(updated_sources) == len(config.search_api.permission_sources):
+            raise KeyError(source_id)
+        config.search_api.permission_sources = updated_sources
+        return self.save_config(config)
 
     def _load_or_initialize_config(self) -> AppConfig:
         payload = self._store.read_json(*_CONFIG_PATH)
@@ -135,6 +191,7 @@ def build_default_app_config(bootstrap: BootstrapSettings) -> AppConfig:
         embedding_profiles=[],
         active_embedding_profile_id=None,
         runtime=RuntimeConfig(),
+        search_api=SearchApiConfig(),
     )
 
 
@@ -146,7 +203,16 @@ def migrate_app_config(payload: dict[str, Any], bootstrap: BootstrapSettings) ->
             data = _migrate_v0_to_v1(data, bootstrap)
             version = 1
             continue
+        if version == 1:
+            data = _migrate_v1_to_v2(data)
+            version = 2
+            continue
+        if version == 2:
+            data = _migrate_v2_to_v3(data)
+            version = 3
+            continue
         raise ValueError(f"Unsupported app config schema version: {version}")
+    data = _normalize_search_api_permission_source_ids(data)
     data["schema_version"] = APP_CONFIG_SCHEMA_VERSION
     return AppConfig.model_validate(data)
 
@@ -158,6 +224,47 @@ def _migrate_v0_to_v1(payload: dict[str, Any], bootstrap: BootstrapSettings) -> 
     runtime_payload = payload.get("runtime", {})
     if isinstance(runtime_payload, dict):
         migrated["runtime"].update(runtime_payload)
+    return migrated
+
+
+def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(payload)
+    runtime_payload = migrated.get("runtime")
+    knowledge_theme = ""
+    if isinstance(runtime_payload, dict):
+        knowledge_theme = str(runtime_payload.pop("knowledge_theme", "") or "")
+
+    neo4j_profiles = migrated.get("neo4j_profiles")
+    if isinstance(neo4j_profiles, list):
+        for profile in neo4j_profiles:
+            if not isinstance(profile, dict):
+                continue
+            profile.setdefault("knowledge_theme", knowledge_theme)
+
+    return migrated
+
+
+def _migrate_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(payload)
+    search_api_payload = migrated.get("search_api")
+    if not isinstance(search_api_payload, dict):
+        migrated["search_api"] = SearchApiConfig().model_dump(mode="json")
+    else:
+        default_payload = SearchApiConfig().model_dump(mode="json")
+        default_payload.update(search_api_payload)
+        migrated["search_api"] = default_payload
+    return migrated
+
+
+def _normalize_search_api_permission_source_ids(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(payload)
+    search_api_payload = migrated.get("search_api")
+    if not isinstance(search_api_payload, dict):
+        return migrated
+    sources = search_api_payload.get("permission_sources")
+    if not isinstance(sources, list):
+        return migrated
+    search_api_payload["permission_sources"] = normalize_permission_source_ids(sources)
     return migrated
 
 

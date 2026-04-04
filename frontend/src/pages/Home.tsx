@@ -111,8 +111,10 @@ export default function Home() {
             {getStatusDot(status.neo4j)}
           </CardHeader>
           <CardContent>
-            <div className="text-xl font-bold mt-2 truncate max-w-full" title={status.neo4j.details?.uri}>
-              {status.neo4j.configured ? (status.neo4j.details?.uri || t("home.uri_hidden")) : t("home.unconfigured_short")}
+            <div className="mt-2">
+              <span className="font-bold font-mono text-sm truncate max-w-full">
+                {status.neo4j.configured ? (status.neo4j.details?.uri || t("home.uri_hidden")) : t("home.unconfigured_short")}
+              </span>
             </div>
             <p className="text-xs text-muted-foreground mt-1">
               {status.neo4j.last_error ? (

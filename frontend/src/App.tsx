@@ -9,12 +9,39 @@ import IndexManagement from './pages/IndexManagement'
 import IndexJobDetail from './pages/IndexJobDetail'
 import SearchPreview from './pages/SearchPreview'
 import Configuration from './pages/Configuration'
-import { Activity } from 'lucide-react'
+import SearchApiAuth from './pages/SearchApiAuth'
+import { Activity, Languages, LogOut } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card'
 import { Input } from './components/ui/input'
 import { Label } from './components/ui/label'
 import { useAuth } from './lib/auth'
+
+
+function isChineseLanguage(language: string) {
+  return language.toLowerCase().startsWith('zh')
+}
+
+function LanguageSwitcher({ className = '' }: { className?: string }) {
+  const { t, i18n } = useTranslation()
+  const isChinese = isChineseLanguage(i18n.resolvedLanguage ?? i18n.language)
+  const nextLanguageLabel = isChinese ? 'English' : '中文'
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      onClick={() => void i18n.changeLanguage(isChinese ? 'en' : 'zh')}
+      className={`h-9 rounded-full border-border/70 bg-background/80 px-3 text-sm shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/70 ${className}`.trim()}
+      aria-label={isChinese ? t('nav.switch_to_english') : t('nav.switch_to_chinese')}
+      title={isChinese ? t('nav.switch_to_english') : t('nav.switch_to_chinese')}
+    >
+      <Languages className="h-4 w-4" />
+      <span>{nextLanguageLabel}</span>
+    </Button>
+  )
+}
 
 
 function LoginScreen() {
@@ -35,7 +62,10 @@ function LoginScreen() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground grid place-items-center px-6">
+    <div className="relative min-h-screen bg-background text-foreground grid place-items-center px-6">
+      <div className="absolute right-6 top-6">
+        <LanguageSwitcher />
+      </div>
       <Card className="w-full max-w-md border-border/70 shadow-2xl shadow-black/10">
         <CardHeader className="space-y-3">
           <div className="flex items-center gap-3 text-lg font-semibold">
@@ -73,16 +103,12 @@ function LoginScreen() {
 }
 
 function App() {
-  const { t, i18n } = useTranslation()
+  const { t } = useTranslation()
   const { ready, authenticated, bypassEnabled, logout, loading } = useAuth()
   const location = useLocation()
 
-  const toggleLanguage = () => {
-    i18n.changeLanguage(i18n.language === 'zh' ? 'en' : 'zh')
-  }
-
   const getNavLinkClass = (path: string) => {
-    return `text-sm hover:underline ${location.pathname === path ? 'font-bold' : ''}`
+    return `text-sm transition-colors hover:text-foreground ${location.pathname === path ? 'font-semibold text-foreground' : 'text-muted-foreground'}`
   }
 
   if (!ready) {
@@ -99,25 +125,30 @@ function App() {
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col font-sans">
-      <header className="border-b px-6 py-4 flex items-center justify-between">
-        <Link to="/" className="flex items-center gap-2 font-semibold text-lg">
-          <Activity className="w-5 h-5" />
-          {t('app.brand')}
-        </Link>
-        <div className="flex gap-4">
-          <Link to="/" className={getNavLinkClass('/')}>{t('nav.home')}</Link>
-          <Link to="/tasks" className={getNavLinkClass('/tasks')}>{t('nav.tasks') || 'Tasks'}</Link>
-          <Link to="/search" className={getNavLinkClass('/search')}>{t('nav.search_preview')}</Link>
-          <Link to="/indexing" className={getNavLinkClass('/indexing')}>{t('nav.index_management')}</Link>
-          <Link to="/config" className={getNavLinkClass('/config')}>{t('nav.configuration')}</Link>
-          {!bypassEnabled ? (
-            <button onClick={() => void logout()} className="text-sm hover:underline" disabled={loading}>
-              {t('auth.logout')}
-            </button>
-          ) : null}
-          <button onClick={toggleLanguage} className="text-sm hover:underline">
-            {i18n.language === 'zh' ? 'English' : '中文'}
-          </button>
+      <header className="border-b px-6 py-4">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:gap-8">
+            <Link to="/" className="flex items-center gap-2 font-semibold text-lg">
+              <Activity className="w-5 h-5" />
+              {t('app.brand')}
+            </Link>
+            <nav className="flex flex-wrap items-center gap-x-5 gap-y-2">
+              <Link to="/" className={getNavLinkClass('/')}>{t('nav.home')}</Link>
+              <Link to="/tasks" className={getNavLinkClass('/tasks')}>{t('nav.tasks') || 'Tasks'}</Link>
+              <Link to="/search" className={getNavLinkClass('/search')}>{t('nav.search_preview')}</Link>
+              <Link to="/indexing" className={getNavLinkClass('/indexing')}>{t('nav.index_management')}</Link>
+              <Link to="/config" className={getNavLinkClass('/config')}>{t('nav.configuration')}</Link>
+            </nav>
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            {!bypassEnabled ? (
+              <Button type="button" variant="ghost" size="sm" onClick={() => void logout()} disabled={loading} className="h-9 gap-2 rounded-full px-3 text-sm">
+                <LogOut className="h-4 w-4" />
+                <span>{t('auth.logout')}</span>
+              </Button>
+            ) : null}
+            <LanguageSwitcher />
+          </div>
         </div>
       </header>
       <main className="flex-1 p-6 max-w-6xl mx-auto w-full">
@@ -129,6 +160,7 @@ function App() {
           <Route path="/indexing/jobs/:jobId" element={<IndexJobDetail />} />
           <Route path="/search" element={<SearchPreview />} />
           <Route path="/config" element={<Configuration />} />
+          <Route path="/config/search-api-auth" element={<SearchApiAuth />} />
         </Routes>
       </main>
     </div>

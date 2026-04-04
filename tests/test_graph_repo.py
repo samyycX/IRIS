@@ -10,6 +10,7 @@ from app.models import (
     JobSummary,
     PageExtraction,
 )
+from app.repos.neo4j_driver import NEO4J_DRIVER_CONFIG
 from app.repos.graph_repo import (
     Neo4jGraphRepository,
     _build_related_url_lookup_terms,
@@ -284,6 +285,51 @@ async def test_upsert_source_tx_writes_full_raw_text_excerpt_for_replacement():
     assert params["raw_text_excerpt"] == raw_text
 
 
+async def test_upsert_source_tx_normalizes_source_and_discovered_urls_before_merging():
+    tx = _FakeTxWithSequentialSingleResults([{}, {}, {}])
+    extraction = PageExtraction(
+        canonical_url="https://mzh.moegirl.org.cn/嘉贝莉娜",
+        title="嘉贝莉娜",
+        summary="摘要",
+        extracted_entities=[],
+        discovered_urls=["https://mzh.moegirl.org.cn/罗伊冰原", "https://mzh.moegirl.org.cn/罗伊冰原"],
+        content_hash="hash",
+        raw_text_excerpt="正文",
+    )
+
+    await Neo4jGraphRepository._upsert_source_tx(tx, "job-1", extraction, "hash")
+
+    upsert_query, upsert_params = tx.calls[0]
+    link_query, link_params = tx.calls[2]
+
+    assert "MERGE (source:Source {canonical_url: $canonical_url})" in upsert_query
+    assert upsert_params["canonical_url"] == "https://mzh.moegirl.org.cn/%E5%98%89%E8%B4%9D%E8%8E%89%E5%A8%9C"
+    assert "MERGE (target:Source {canonical_url: $target_url})" in link_query
+    assert link_params["source_url"] == "https://mzh.moegirl.org.cn/%E5%98%89%E8%B4%9D%E8%8E%89%E5%A8%9C"
+    assert link_params["target_url"] == "https://mzh.moegirl.org.cn/%E7%BD%97%E4%BC%8A%E5%86%B0%E5%8E%9F"
+
+
+async def test_ensure_source_canonical_key_tx_rekeys_existing_variant_to_canonical():
+    tx = _FakeTxWithSequentialSingleResults(
+        [{"existing_canonical_url": "https://mzh.moegirl.org.cn/嘉贝莉娜"}, {}]
+    )
+
+    await Neo4jGraphRepository._ensure_source_canonical_key_tx(
+        tx,
+        "https://mzh.moegirl.org.cn/%E5%98%89%E8%B4%9D%E8%8E%89%E5%A8%9C",
+    )
+
+    lookup_query, lookup_params = tx.calls[0]
+    rekey_query, rekey_params = tx.calls[1]
+
+    assert "WHERE source.canonical_url IN $candidate_urls" in lookup_query
+    assert "https://mzh.moegirl.org.cn/嘉贝莉娜" in lookup_params["candidate_urls"]
+    assert "https://mzh.moegirl.org.cn/%E5%98%89%E8%B4%9D%E8%8E%89%E5%A8%9C" in lookup_params["candidate_urls"]
+    assert "SET source.canonical_url = $canonical_url" in rekey_query
+    assert rekey_params["existing_canonical_url"] == "https://mzh.moegirl.org.cn/嘉贝莉娜"
+    assert rekey_params["canonical_url"] == "https://mzh.moegirl.org.cn/%E5%98%89%E8%B4%9D%E8%8E%89%E5%A8%9C"
+
+
 async def test_query_read_records_passes_query_param_via_parameters_dict():
     session = _FakeSession([{"value": "角色甲"}])
     repo = Neo4jGraphRepository(Settings(NEO4J_PASSWORD="pw"))
@@ -318,6 +364,70 @@ async def test_query_fulltext_sources_escapes_query_before_running_cypher():
         "limit": 3,
     }
     assert kwargs == {}
+
+
+def test_source_search_queries_exclude_placeholder_sources():
+    from app.repos.graph_repo import _SOURCE_FULLTEXT_QUERY_CYPHER, _SOURCE_VECTOR_QUERY_CYPHER
+
+    for query in (_SOURCE_VECTOR_QUERY_CYPHER, _SOURCE_FULLTEXT_QUERY_CYPHER):
+        assert "node.fetched_at IS NOT NULL" in query
+        assert "coalesce(trim(node.title), '') <> ''" in query
+        assert "coalesce(trim(node.summary), '') <> ''" in query
+
+
+def test_source_index_candidate_queries_exclude_placeholder_sources():
+    from app.repos.graph_repo import (
+        _SOURCE_EMBEDDING_CANDIDATES_CYPHER,
+        _SOURCE_FULLTEXT_CANDIDATES_CYPHER,
+    )
+
+    for query in (_SOURCE_EMBEDDING_CANDIDATES_CYPHER, _SOURCE_FULLTEXT_CANDIDATES_CYPHER):
+        assert "source.fetched_at IS NOT NULL" in query
+        assert "coalesce(trim(source.title), '') <> ''" in query
+        assert "coalesce(trim(source.summary), '') <> ''" in query
+
+
+def test_build_source_lookup_variants_includes_encoded_form_for_same_host():
+    from app.repos.graph_repo import _build_source_lookup_variants
+
+    variants = _build_source_lookup_variants("https://mzh.moegirl.org.cn/嘉贝莉娜")
+
+    assert "https://mzh.moegirl.org.cn/嘉贝莉娜" in variants
+    assert "https://mzh.moegirl.org.cn/%E5%98%89%E8%B4%9D%E8%8E%89%E5%A8%9C" in variants
+
+
+async def test_graph_repo_connect_sets_driver_notification_thresholds(monkeypatch):
+    calls: list[tuple[str, tuple[str, str], dict]] = []
+
+    def fake_driver(uri: str, *, auth=None, **config):
+        calls.append((uri, auth, config))
+        return object()
+
+    monkeypatch.setattr("app.repos.graph_repo.AsyncGraphDatabase.driver", fake_driver)
+    repo = Neo4jGraphRepository(
+        Settings(
+            NEO4J_URI="neo4j://127.0.0.1:7687",
+            NEO4J_USERNAME="neo4j",
+            NEO4J_PASSWORD="pw",
+        )
+    )
+
+    await repo.connect()
+
+    assert calls == [
+        (
+            "neo4j://127.0.0.1:7687",
+            ("neo4j", "pw"),
+            NEO4J_DRIVER_CONFIG,
+        )
+    ]
+
+
+def test_relation_vector_query_does_not_read_missing_stored_score_property():
+    from app.repos.graph_repo import _RELATION_VECTOR_QUERY_CYPHER
+
+    assert "node['score']" not in _RELATION_VECTOR_QUERY_CYPHER
+    assert "YIELD node, score" in _RELATION_VECTOR_QUERY_CYPHER
 
 
 async def test_prepare_embedding_candidates_returns_empty_when_neo4j_is_degraded():

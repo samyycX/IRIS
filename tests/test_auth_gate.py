@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import router
 from app.main import require_password_gate
 from app.models import RuntimeStatusResponse
+from app.models.config import SearchPermissionSourceKind
 from app.services.auth import PasswordGateService
 
 
@@ -50,12 +51,96 @@ class _FakeRuntimeStatus:
         )
 
 
+class _FakeSearchApi:
+    async def authorize_request(self, request: Request):
+        del request
+        return SimpleNamespace(
+            authenticated=True,
+            validation_enabled=False,
+            matched_permission_source_id=None,
+            matched_permission_source_kind=None,
+            allow_builtin_embedding=True,
+        )
+
+    async def get_capabilities(self, request: Request):
+        del request
+        return {
+            "enabled": True,
+            "validation_enabled": False,
+            "authenticated": True,
+            "matched_permission_source_id": None,
+            "matched_permission_source_kind": None,
+            "allow_builtin_embedding": True,
+            "embedding_dimensions": 1536,
+            "supported_modes": ["fulltext", "vector", "hybrid"],
+            "query_vector_required_for_semantic_search": False,
+        }
+
+    async def get_entity_detail(self, entity_id: str):
+        return {
+            "entity": {
+                "entity_id": entity_id,
+                "name": "角色甲",
+                "normalized_name": "角色甲",
+                "category": "character",
+                "summary": "示例实体",
+                "aliases": [],
+                "mentioned_in_sources": [],
+                "outgoing_relations": [],
+                "incoming_relations": [],
+            }
+        }
+
+    async def lookup_entities(self, *, name: str | None, alias: str | None, limit: int):
+        del name, alias, limit
+        return {"items": []}
+
+    async def get_source_detail(self, canonical_url: str):
+        return {
+            "source": {
+                "source_key": canonical_url,
+                "canonical_url": canonical_url,
+                "title": "Example",
+                "summary": "Summary",
+                "fetched_at": None,
+                "content_hash": None,
+                "outgoing_links": [],
+                "incoming_links": [],
+                "mentioned_entities": [],
+            }
+        }
+
+    async def query(self, payload, access):
+        del payload, access
+        return {
+            "query_text": "角色甲",
+            "mode": "fulltext",
+            "query_vector_provided": False,
+            "capabilities": {
+                "enabled": True,
+                "validation_enabled": False,
+                "authenticated": True,
+                "matched_permission_source_id": None,
+                "matched_permission_source_kind": None,
+                "allow_builtin_embedding": True,
+                "embedding_dimensions": 1536,
+                "supported_modes": ["fulltext", "vector", "hybrid"],
+                "query_vector_required_for_semantic_search": False,
+            },
+            "entities": [],
+            "sources": [],
+            "relations": [],
+            "neighborhoods": [],
+        }
+
+
 def _build_app(*, password: str = "", bypass_enabled: bool = False) -> FastAPI:
     app = FastAPI()
     app.middleware("http")(require_password_gate)
     app.state.container = SimpleNamespace(
         auth=PasswordGateService(password=password, bypass_enabled=bypass_enabled),
         runtime_status=_FakeRuntimeStatus(),
+        search_api=_FakeSearchApi(),
     )
     app.include_router(router)
 
@@ -109,3 +194,13 @@ def test_auth_gate_bypass_allows_direct_access():
         "authenticated": True,
     }
     assert protected.status_code == 200
+
+
+def test_external_search_api_is_not_blocked_by_dashboard_cookie_gate():
+    client = TestClient(_build_app(password="secret"))
+
+    search_response = client.get("/api/search/v1/capabilities")
+    protected_config = client.get("/api/config")
+
+    assert search_response.status_code == 200
+    assert protected_config.status_code == 401

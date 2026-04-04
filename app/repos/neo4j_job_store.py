@@ -25,6 +25,7 @@ from app.models import (
     utcnow,
 )
 from app.repos.job_store import JobStore
+from app.repos.neo4j_driver import NEO4J_DRIVER_CONFIG
 
 logger = get_logger(__name__)
 
@@ -56,6 +57,7 @@ class Neo4jJobStore(JobStore):
         self._driver = AsyncGraphDatabase.driver(
             self._settings.neo4j_uri,
             auth=(self._settings.neo4j_username, self._settings.neo4j_password),
+            **NEO4J_DRIVER_CONFIG,
         )
 
     async def close(self) -> None:

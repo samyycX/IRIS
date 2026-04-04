@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 TRACKING_QUERY_PREFIXES = ("utm_", "spm", "fbclid", "gclid")
 REDIRECT_QUERY_KEYS = ("url", "target", "dest", "destination", "redirect", "redirect_url", "redir", "to", "link")
@@ -14,7 +14,7 @@ class URLCanonicalizer:
         parts = urlsplit(absolute)
         scheme = parts.scheme.lower() or "https"
         netloc = parts.netloc.lower()
-        path = parts.path or "/"
+        path = self._normalize_path(parts.path or "/")
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
 
@@ -25,6 +25,10 @@ class URLCanonicalizer:
         ]
         query = urlencode(filtered_query, doseq=True)
         return urlunsplit((scheme, netloc, path, query, ""))
+
+    def _normalize_path(self, path: str) -> str:
+        decoded_path = self._decode_url(path or "/")
+        return quote(decoded_path, safe="/%:@!$&'()*+,;=-._~") or "/"
 
     def _decode_url(self, url: str) -> str:
         decoded = url.strip()

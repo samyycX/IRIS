@@ -28,6 +28,7 @@ from app.services.llm import EmbeddingClient, LLMClient
 from app.services.llm.orchestrator import LlmOrchestrator
 from app.services.indexing import IndexingService
 from app.services.runtime_status import RuntimeStatusService
+from app.services.search_api import SearchApiService
 from app.services.tools import (
     DiscoverLinksTool,
     ExtractMainContentTool,
@@ -77,6 +78,7 @@ class ServiceContainer:
         self.tool_executor: ToolExecutor | None = None
         self.llm_orchestrator: LlmOrchestrator | None = None
         self.indexing: IndexingService | None = None
+        self.search_api: SearchApiService | None = None
         self.pipeline: CrawlPipeline | None = None
         self.jobs: JobService | None = None
         self.runtime_status: RuntimeStatusService | None = None
@@ -89,8 +91,9 @@ class ServiceContainer:
 
     async def reload_runtime(self) -> None:
         await self._close_runtime_components()
-        runtime_settings = self.config_service.get_runtime_settings()
-        self._build_runtime_components(runtime_settings)
+        app_config = self.config_service.get_config()
+        runtime_settings = Settings.from_sources(self.bootstrap_settings, app_config)
+        self._build_runtime_components(runtime_settings, app_config)
         self._register_tools()
         try:
             await self.graph_repo.ensure_constraints()
@@ -100,6 +103,19 @@ class ServiceContainer:
             await self._degrade_neo4j_after_startup_failure(exc)
         await self.indexing.initialize()
         await self.runtime_status.start()
+
+    async def reload_search_api_config(self) -> None:
+        app_config = self.config_service.get_config()
+        if self.search_api is None:
+            runtime_settings = Settings.from_sources(self.bootstrap_settings, app_config)
+            self.search_api = SearchApiService(
+                settings=runtime_settings,
+                graph_repo=self.graph_repo,
+                embedding_client=self.embedding_client,
+                config=app_config.search_api,
+            )
+            return
+        self.search_api.replace_config(app_config.search_api)
 
     async def _degrade_neo4j_after_startup_failure(self, exc: BaseException) -> None:
         logger.warning(
@@ -116,12 +132,14 @@ class ServiceContainer:
             await self.event_store.mark_neo4j_unavailable()
 
     def _register_tools(self) -> None:
-        self.tool_registry.register(FetchUrlTool(self.fetcher, self.extractor, self.discovery))
+        self.tool_registry.register(
+            FetchUrlTool(self.fetcher, self.extractor, self.discovery, self.canonicalizer)
+        )
         self.tool_registry.register(ExtractMainContentTool(self.extractor))
         self.tool_registry.register(DiscoverLinksTool(self.discovery))
         self.tool_registry.register(UpsertKgEntityTool(self.kg_service))
 
-    def _build_runtime_components(self, settings: Settings) -> None:
+    def _build_runtime_components(self, settings: Settings, app_config) -> None:
         self.settings = settings
         self.event_store = Neo4jJobStore(settings)
         self.embedding_client = EmbeddingClient(settings)
@@ -151,6 +169,12 @@ class ServiceContainer:
             graph_repo=self.graph_repo,
             embedding_client=self.embedding_client,
             job_store=self.index_job_store,
+        )
+        self.search_api = SearchApiService(
+            settings=settings,
+            graph_repo=self.graph_repo,
+            embedding_client=self.embedding_client,
+            config=app_config.search_api,
         )
         self.pipeline = CrawlPipeline(
             event_store=self.event_store,
