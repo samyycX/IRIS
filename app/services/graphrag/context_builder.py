@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from app.services.graphrag.models import GraphRAGContext, GraphRAGContextDocument
 
-
 def build_context_documents(context: GraphRAGContext) -> list[GraphRAGContextDocument]:
     documents: list[GraphRAGContextDocument] = []
 
