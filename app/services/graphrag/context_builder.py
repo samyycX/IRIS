@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from app.services.graphrag.models import GraphRAGContext, GraphRAGContextDocument
 
 
@@ -108,14 +106,3 @@ def build_prompt_context(context: GraphRAGContext) -> str:
         sections.append("[candidate_url_entity_context]\n" + "\n\n".join(lines))
 
     return "\n\n".join(sections).strip()
-
-
-def build_preview_payload(context: GraphRAGContext) -> dict[str, Any]:
-    return {
-        "query": context.query,
-        "entities": context.entities,
-        "sources": context.sources,
-        "relations": context.relations,
-        "neighborhoods": context.neighborhoods,
-        "documents": [document.model_dump(mode="json") for document in context.documents],
-    }
