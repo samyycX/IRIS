@@ -140,14 +140,6 @@ class JobSummary(BaseModel):
     completion_reason: str | None = None
 
 
-class CrawlContext(BaseModel):
-    job_id: str
-    current_depth: int
-    seed_url: str
-    max_depth: int
-    max_pages: int
-
-
 class CrawlPageResult(BaseModel):
     url: str
     canonical_url: str

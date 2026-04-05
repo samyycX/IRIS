@@ -1,6 +1,5 @@
 from app.models.auth import AuthLoginRequest, AuthStatusResponse
 from app.models.jobs import (
-    CrawlContext,
     CrawlPageResult,
     ExtractedEntity,
     GraphUpdateResult,
@@ -83,7 +82,6 @@ from app.models.search_api import (
 __all__ = [
     "AuthLoginRequest",
     "AuthStatusResponse",
-    "CrawlContext",
     "CrawlPageResult",
     "ExtractedEntity",
     "GraphUpdateResult",

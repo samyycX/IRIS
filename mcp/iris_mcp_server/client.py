@@ -113,7 +113,7 @@ class IrisSearchApiClient:
                 return self._handle_response(response, response_model)
             except httpx.TimeoutException as exc:
                 last_error = IrisApiError(
-                    message=f"Timed out calling IRIS search API at {url}",
+                    message=f"Timed out calling IRIS search API at {url}: {exc}",
                     code="timeout",
                     retriable=True,
                 )

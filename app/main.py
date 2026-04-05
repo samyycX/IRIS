@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Callable
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,8 +17,6 @@ from app.api.routes import router as api_router
 from app.core.config import get_settings
 from app.core.container import ServiceContainer
 from app.core.logging import configure_logging
-from app.models import RuntimeStatusResponse
-
 
 _AUTH_EXEMPT_PATHS = {
     "/healthz",

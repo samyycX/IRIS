@@ -3,12 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.models import PageExtraction
-from app.repos.graph_repo import Neo4jGraphRepository
 from app.services.crawl.canonicalizer import URLCanonicalizer
 from app.services.crawl.discovery import LinkDiscoveryService
 from app.services.crawl.extractor import ContentExtractor
 from app.services.crawl.fetcher import HttpFetcher
-from app.services.graphrag.retrievers import EntityContextRetriever
 from app.services.kg.service import KnowledgeGraphService
 from app.services.tools.base import BaseTool
 
@@ -103,38 +101,6 @@ class DiscoverLinksTool(BaseTool):
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         links = self._discovery.discover(kwargs["html"], kwargs["base_url"])
         return {"links": links}
-
-
-class QueryNeo4jContextTool(BaseTool):
-    name = "query_neo4j_context"
-    description = "查询现有知识图谱中与关键词相关的实体上下文。"
-    schema = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"},
-            "limit": {"type": "integer", "default": 5},
-            "candidate_urls": {"type": "array", "items": {"type": "string"}},
-            "candidate_limit": {"type": "integer", "default": 2},
-        },
-        "required": ["query"],
-    }
-
-    def __init__(self, graph_repo: Neo4jGraphRepository) -> None:
-        self._graph_repo = graph_repo
-
-    async def execute(self, **kwargs: Any) -> dict[str, Any]:
-        matches = await EntityContextRetriever(
-            graph_repo=self._graph_repo,
-            limit=kwargs.get("limit", 5),
-        ).aget_records(kwargs["query"])
-        candidate_url_entity_context = await self._graph_repo.query_related_url_entity_context(
-            kwargs.get("candidate_urls", []),
-            limit_per_url=kwargs.get("candidate_limit", 2),
-        )
-        return {
-            "matches": matches,
-            "candidate_url_entity_context": candidate_url_entity_context,
-        }
 
 
 class UpsertKgEntityTool(BaseTool):
