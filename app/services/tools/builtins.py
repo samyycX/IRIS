@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.i18n import render_text
 from app.models import PageExtraction
 from app.repos.graph_repo import Neo4jGraphRepository
 from app.services.crawl.canonicalizer import URLCanonicalizer
@@ -15,7 +16,6 @@ from app.services.tools.base import BaseTool
 
 class FetchUrlTool(BaseTool):
     name = "fetch_url"
-    description = "抓取 URL 并返回 HTML、正文与状态信息。"
     schema = {
         "type": "object",
         "properties": {
@@ -37,6 +37,10 @@ class FetchUrlTool(BaseTool):
         self._discovery = discovery
         self._canonicalizer = canonicalizer
 
+    @property
+    def description(self) -> str:
+        return render_text("tool.fetch_url.description")
+
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         url = kwargs["url"]
         referer = kwargs.get("referer")
@@ -56,7 +60,6 @@ class FetchUrlTool(BaseTool):
 
 class ExtractMainContentTool(BaseTool):
     name = "extract_main_content"
-    description = "从 HTML 中抽取正文、标题和摘要输入。"
     schema = {
         "type": "object",
         "properties": {
@@ -73,6 +76,10 @@ class ExtractMainContentTool(BaseTool):
     def __init__(self, extractor: ContentExtractor) -> None:
         self._extractor = extractor
 
+    @property
+    def description(self) -> str:
+        return render_text("tool.extract_main_content.description")
+
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         page = self._extractor.extract(
             url=kwargs["url"],
@@ -87,7 +94,6 @@ class ExtractMainContentTool(BaseTool):
 
 class DiscoverLinksTool(BaseTool):
     name = "discover_links"
-    description = "从 HTML 中发现允许域名内的未规范化链接。"
     schema = {
         "type": "object",
         "properties": {
@@ -100,6 +106,10 @@ class DiscoverLinksTool(BaseTool):
     def __init__(self, discovery: LinkDiscoveryService) -> None:
         self._discovery = discovery
 
+    @property
+    def description(self) -> str:
+        return render_text("tool.discover_links.description")
+
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         links = self._discovery.discover(kwargs["html"], kwargs["base_url"])
         return {"links": links}
@@ -107,7 +117,6 @@ class DiscoverLinksTool(BaseTool):
 
 class QueryNeo4jContextTool(BaseTool):
     name = "query_neo4j_context"
-    description = "查询现有知识图谱中与关键词相关的实体上下文。"
     schema = {
         "type": "object",
         "properties": {
@@ -121,6 +130,10 @@ class QueryNeo4jContextTool(BaseTool):
 
     def __init__(self, graph_repo: Neo4jGraphRepository) -> None:
         self._graph_repo = graph_repo
+
+    @property
+    def description(self) -> str:
+        return render_text("tool.query_neo4j_context.description")
 
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         matches = await EntityContextRetriever(
@@ -139,7 +152,6 @@ class QueryNeo4jContextTool(BaseTool):
 
 class UpsertKgEntityTool(BaseTool):
     name = "upsert_kg_entity"
-    description = "将页面抽取结果写入知识图谱，支持关系新增与删除。"
     schema = {
         "type": "object",
         "properties": {
@@ -151,6 +163,10 @@ class UpsertKgEntityTool(BaseTool):
 
     def __init__(self, kg_service: KnowledgeGraphService) -> None:
         self._kg_service = kg_service
+
+    @property
+    def description(self) -> str:
+        return render_text("tool.upsert_kg_entity.description")
 
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         extraction = PageExtraction.model_validate(kwargs["extraction"])

@@ -6,6 +6,7 @@ import contextlib
 from fastapi import HTTPException
 
 from app.core.config import Settings
+from app.core.i18n import render_text
 from app.core.logging import get_logger
 from app.models import (
     EmbeddingCandidate,
@@ -64,7 +65,10 @@ class IndexingService:
         return await self._job_store.get_job(job_id)
 
     async def get_events(self, job_id: str) -> list[IndexJobEvent]:
-        return await self._job_store.get_events(job_id)
+        return [
+            event.localized(self._settings.ui_language.value)
+            for event in await self._job_store.get_events(job_id)
+        ]
 
     async def prepare(self, request: IndexPreparationRequest) -> IndexPreparationResponse:
         await self._ensure_graph_available()
@@ -107,7 +111,7 @@ class IndexingService:
         skipped: list[tuple[IndexType, str]] = []
         for index_type in (IndexType.fulltext, IndexType.vector):
             if index_type == IndexType.vector and not self._embedding_client.enabled:
-                skipped.append((index_type, "Embedding client is not configured"))
+                skipped.append((index_type, render_text("embedding_client_not_configured")))
                 continue
             try:
                 response = await self.create_backfill_job(
@@ -159,10 +163,10 @@ class IndexingService:
             batch_size=batch_size,
         )
         await self._job_store.append_event(
-            IndexJobEvent(
+            self._build_event(
                 job_id=summary.job_id,
                 stage=IndexJobStage.queued,
-                message=f"{request.index_type.value} 索引任务已创建，等待执行",
+                message_key="indexing.job_created_queued",
                 data={
                     "index_type": request.index_type.value,
                     "mode": mode.value,
@@ -189,10 +193,10 @@ class IndexingService:
             return
         await self._job_store.update_job(job_id, status=IndexJobStatus.running)
         await self._job_store.append_event(
-            IndexJobEvent(
+            self._build_event(
                 job_id=job_id,
                 stage=IndexJobStage.scanning,
-                message="开始扫描待同步索引对象",
+                message_key="indexing.scan_started",
                 data={
                     "index_type": request.index_type.value,
                     "scope": request.scope.value,
@@ -247,10 +251,10 @@ class IndexingService:
                     failed_count=failed_count,
                 )
                 await self._job_store.append_event(
-                    IndexJobEvent(
+                    self._build_event(
                         job_id=job_id,
                         stage=IndexJobStage.indexing,
-                        message="开始处理一批索引对象",
+                        message_key="indexing.batch_started",
                         data={
                             "index_type": request.index_type.value,
                             "batch_size": len(candidates),
@@ -271,11 +275,12 @@ class IndexingService:
 
             await self._job_store.finish_job(job_id, status=IndexJobStatus.completed)
             await self._job_store.append_event(
-                IndexJobEvent(
+                self._build_event(
                     job_id=job_id,
                     stage=IndexJobStage.completed,
-                    message=f"{request.index_type.value} 索引任务执行完成",
+                    message_key="indexing.job_completed",
                     data={
+                        "index_type": request.index_type.value,
                         "scanned_count": scanned_count,
                         "synced_count": synced_count,
                         "failed_count": failed_count,
@@ -290,11 +295,14 @@ class IndexingService:
                 last_error=str(exc),
             )
             await self._job_store.append_event(
-                IndexJobEvent(
+                self._build_event(
                     job_id=job_id,
                     stage=IndexJobStage.failed,
-                    message=f"{request.index_type.value} 索引任务执行失败",
-                    data={"error": str(exc)},
+                    message_key="indexing.job_failed",
+                    data={
+                        "index_type": request.index_type.value,
+                        "error": str(exc),
+                    },
                 )
             )
 
@@ -359,7 +367,10 @@ class IndexingService:
             active = active_jobs[0]
             raise HTTPException(
                 status_code=409,
-                detail=f"已有运行中的 {index_type.value} 索引任务：{active.job_id}",
+                detail=render_text(
+                    "indexing.active_job_conflict",
+                    params={"index_type": index_type.value, "job_id": active.job_id},
+                ),
             )
 
     async def _count_pending_candidates(
@@ -386,11 +397,28 @@ class IndexingService:
     def _ensure_embedding_enabled(self) -> None:
         if self._embedding_client.enabled:
             return
-        raise HTTPException(status_code=503, detail="Embedding client is not configured")
+        raise HTTPException(status_code=503, detail=render_text("embedding_client_not_configured"))
 
     async def _ensure_graph_available(self) -> None:
         try:
             await self._graph_repo.ensure_available()
         except Neo4jUnavailableError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def _build_event(
+        self,
+        *,
+        job_id: str,
+        stage: IndexJobStage,
+        message_key: str,
+        data: dict[str, object] | None = None,
+    ) -> IndexJobEvent:
+        payload = dict(data or {})
+        return IndexJobEvent(
+            job_id=job_id,
+            stage=stage,
+            message_key=message_key,
+            message_params=payload,
+            data=payload,
+        ).localized(self._settings.ui_language.value)
 

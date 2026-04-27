@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import router
 from app.main import require_password_gate
-from app.models import RuntimeStatusResponse
+from app.models import AppConfig, RuntimeConfig, RuntimeStatusResponse, UiLanguage
 from app.models.config import SearchPermissionSourceKind
 from app.services.auth import PasswordGateService
 
@@ -134,11 +134,20 @@ class _FakeSearchApi:
         }
 
 
+class _FakeConfigService:
+    def __init__(self, ui_language: UiLanguage = UiLanguage.zh) -> None:
+        self._config = AppConfig(runtime=RuntimeConfig(ui_language=ui_language))
+
+    def get_config(self) -> AppConfig:
+        return self._config.model_copy(deep=True)
+
+
 def _build_app(*, password: str = "", bypass_enabled: bool = False) -> FastAPI:
     app = FastAPI()
     app.middleware("http")(require_password_gate)
     app.state.container = SimpleNamespace(
         auth=PasswordGateService(password=password, bypass_enabled=bypass_enabled),
+        config_service=_FakeConfigService(),
         runtime_status=_FakeRuntimeStatus(),
         search_api=_FakeSearchApi(),
     )
@@ -163,6 +172,7 @@ def test_auth_gate_rejects_protected_routes_until_login():
     assert client.get("/api/auth/status").json() == {
         "bypass_enabled": False,
         "authenticated": False,
+        "ui_language": "zh",
     }
 
 
@@ -192,6 +202,7 @@ def test_auth_gate_bypass_allows_direct_access():
     assert status_response.json() == {
         "bypass_enabled": True,
         "authenticated": True,
+        "ui_language": "zh",
     }
     assert protected.status_code == 200
 

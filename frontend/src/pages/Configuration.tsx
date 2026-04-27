@@ -8,6 +8,8 @@ import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { syncUiLanguage, type UiLanguage } from '@/i18n'
 import { apiFetch } from '@/lib/auth'
 
 interface Profile {
@@ -102,6 +104,9 @@ export default function Configuration() {
 
   const updateRuntimeField = async (key: string, value: any) => {
     if (!config) return;
+    if (key === 'ui_language') {
+      await syncUiLanguage(value as UiLanguage);
+    }
     const newConfig = {
       ...config,
       runtime: { ...config.runtime, [key]: value }
@@ -346,6 +351,22 @@ export default function Configuration() {
 
       <CollapsibleCard title={t('config.data_collection')}>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="grid gap-2">
+            <Label>{t('runtime.ui_language')}</Label>
+            <Select
+              value={config.runtime.ui_language || 'zh'}
+              onValueChange={(value) => value && void updateRuntimeField('ui_language', value as UiLanguage)}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="zh">{t('runtime.ui_language_zh')}</SelectItem>
+                <SelectItem value="en">{t('runtime.ui_language_en')}</SelectItem>
+              </SelectContent>
+            </Select>
+            <span className="text-xs text-muted-foreground">{t('runtime.ui_language_desc')}</span>
+          </div>
           <div className="grid gap-2">
             <Label>{t('runtime.visited_url_ttl_days')}</Label>
             <Input 

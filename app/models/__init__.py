@@ -29,6 +29,7 @@ from app.models.config import (
     SearchApiConfig,
     SearchPermissionSource,
     SearchPermissionSourceKind,
+    UiLanguage,
 )
 from app.models.indexing import (
     EmbeddingCandidate,
@@ -148,6 +149,7 @@ __all__ = [
     "SearchPreviewRequest",
     "SearchPreviewResponse",
     "TextIndexCandidate",
+    "UiLanguage",
     "DependencyHealthState",
     "DependencyStatus",
     "GraphStatistics",

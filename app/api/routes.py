@@ -56,32 +56,39 @@ def _find_search_permission_source(request: Request, source_id: str) -> SearchPe
     raise HTTPException(status_code=404, detail="Permission source not found")
 
 
+def _auth_status_response(request: Request, *, authenticated: bool) -> AuthStatusResponse:
+    container = _container(request)
+    auth = container.auth
+    return AuthStatusResponse(
+        bypass_enabled=auth.bypass_enabled,
+        authenticated=authenticated,
+        ui_language=container.config_service.get_config().runtime.ui_language,
+    )
+
+
 @router.get("/auth/status")
 async def auth_status(request: Request) -> AuthStatusResponse:
     auth = _container(request).auth
-    return AuthStatusResponse(
-        bypass_enabled=auth.bypass_enabled,
-        authenticated=auth.is_request_authenticated(request),
-    )
+    return _auth_status_response(request, authenticated=auth.is_request_authenticated(request))
 
 
 @router.post("/auth/login")
 async def login(request: Request, payload: AuthLoginRequest, response: Response) -> AuthStatusResponse:
     auth = _container(request).auth
     if auth.bypass_enabled:
-        return AuthStatusResponse(bypass_enabled=True, authenticated=True)
+        return _auth_status_response(request, authenticated=True)
     if not auth.verify_password(payload.password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password")
     auth.attach_session_cookie(response)
-    return AuthStatusResponse(bypass_enabled=False, authenticated=True)
+    return _auth_status_response(request, authenticated=True)
 
 
 @router.post("/auth/logout")
 async def logout(request: Request, response: Response) -> AuthStatusResponse:
     auth = _container(request).auth
     auth.clear_session_cookie(request, response)
-    return AuthStatusResponse(
-        bypass_enabled=auth.bypass_enabled,
+    return _auth_status_response(
+        request,
         authenticated=False if not auth.bypass_enabled else True,
     )
 

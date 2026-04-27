@@ -11,6 +11,14 @@ from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
 
 from app.core.config import Settings
+from app.core.job_text import (
+    build_graph_update_summary as _localized_build_graph_update_summary,
+    build_job_change_log_text as _localized_build_job_change_log_text,
+    build_job_summary_text as _localized_build_job_summary_text,
+    build_source_change_log as _localized_build_source_change_log,
+    build_source_modification_summary as _localized_build_source_modification_summary,
+    format_string_list as _localized_format_string_list,
+)
 from app.core.logging import get_logger
 from app.models import (
     EmbeddingCandidate,
@@ -3039,62 +3047,15 @@ def _build_job_node_payload(
 
 
 def _build_job_summary_text(job: JobSummary) -> str:
-    parts = [
-        f"任务状态：{job.status.value}",
-        f"输入类型：{job.input_type.value}",
-        f"种子：{job.seed}",
-        f"访问页面：{job.visited_count}",
-        f"队列长度：{job.queued_count}",
-        f"失败数：{job.failed_count}",
-        f"抓取限制：深度 {job.max_depth} / 页面 {job.max_pages}",
-    ]
-    if job.graph_update is not None:
-        parts.append(_build_graph_update_summary(job.graph_update))
-    if job.last_error:
-        parts.append(f"最近错误：{job.last_error}")
-    if job.completed_at:
-        parts.append(f"完成时间：{job.completed_at.isoformat()}")
-    return "；".join(parts)
+    return _localized_build_job_summary_text(job)
 
 
 def _build_job_change_log_text(job: JobSummary) -> str:
-    lines = [
-        "任务概览",
-        f"- 状态：{job.status.value}",
-        f"- 输入类型：{job.input_type.value}",
-        f"- 种子：{job.seed}",
-        f"- 创建时间：{job.created_at.isoformat()}",
-        f"- 更新时间：{job.updated_at.isoformat()}",
-        f"- 完成时间：{job.completed_at.isoformat() if job.completed_at else '未完成'}",
-        f"- 抓取限制：最大深度 {job.max_depth}，最大页面数 {job.max_pages}",
-        f"- 执行统计：访问页面 {job.visited_count}，队列剩余 {job.queued_count}，失败数 {job.failed_count}",
-    ]
-    if job.graph_update is not None:
-        lines.extend(
-            [
-                "",
-                "修改记录",
-                f"- 新增来源（{len(job.graph_update.created_sources)}）：{_format_string_list(job.graph_update.created_sources)}",
-                f"- 新增实体（{len(job.graph_update.created_entities)}）：{_format_string_list(job.graph_update.created_entities)}",
-                f"- 更新实体（{len(job.graph_update.updated_entities)}）：{_format_string_list(job.graph_update.updated_entities)}",
-                f"- 新增关系：{job.graph_update.created_relationships}",
-                f"- 删除关系：{job.graph_update.deleted_relationships}",
-            ]
-        )
-    if job.last_error:
-        lines.extend(["", "错误信息", f"- {job.last_error}"])
-    return "\n".join(lines)
+    return _localized_build_job_change_log_text(job)
 
 
 def _build_graph_update_summary(update: GraphUpdateResult) -> str:
-    return (
-        "图谱变更："
-        f"新增来源 {len(update.created_sources)} 个，"
-        f"新增实体 {len(update.created_entities)} 个，"
-        f"更新实体 {len(update.updated_entities)} 个，"
-        f"新增关系 {update.created_relationships} 条，"
-        f"删除关系 {update.deleted_relationships} 条"
-    )
+    return _localized_build_graph_update_summary(update)
 
 
 def _build_source_modification_summary(
@@ -3103,18 +3064,11 @@ def _build_source_modification_summary(
     source_created: bool,
     source_update: dict[str, Any],
 ) -> str:
-    parts = [
-        f"来源：{extraction.canonical_url}",
-        "来源状态：新增来源" if source_created else "来源状态：更新已有来源",
-        f"来源摘要长度：{len(extraction.summary)}",
-        f"抽取实体：{len(extraction.extracted_entities)} 个",
-        f"发现链接：{len(extraction.discovered_urls)} 个",
-        f"新增实体：{len(source_update.get('created_entities', []))} 个",
-        f"更新实体：{len(source_update.get('updated_entities', []))} 个",
-        f"新增关系：{source_update.get('created_relationships', 0)} 条",
-        f"删除关系：{source_update.get('deleted_relationships', 0)} 条",
-    ]
-    return "；".join(parts)
+    return _localized_build_source_modification_summary(
+        extraction=extraction,
+        source_created=source_created,
+        source_update=source_update,
+    )
 
 
 def _build_source_change_log(
@@ -3123,31 +3077,15 @@ def _build_source_change_log(
     source_created: bool,
     source_update: dict[str, Any],
 ) -> str:
-    lines = [
-        "来源修改详情",
-        f"- 来源 URL：{extraction.canonical_url}",
-        f"- 来源标题：{extraction.title or '无标题'}",
-        f"- 来源状态：{'新增来源' if source_created else '更新已有来源'}",
-        f"- 来源摘要：{extraction.summary or '无摘要'}",
-        f"- 抽取实体数：{len(extraction.extracted_entities)}",
-        f"- 发现链接数：{len(extraction.discovered_urls)}",
-        f"- 新增实体（{len(source_update.get('created_entities', []))}）：{_format_string_list(source_update.get('created_entities', []))}",
-        f"- 更新实体（{len(source_update.get('updated_entities', []))}）：{_format_string_list(source_update.get('updated_entities', []))}",
-        f"- 新增来源引用（{len(source_update.get('created_sources', []))}）：{_format_string_list(source_update.get('created_sources', []))}",
-        f"- 新增关系：{source_update.get('created_relationships', 0)}",
-        f"- 删除关系：{source_update.get('deleted_relationships', 0)}",
-    ]
-    return "\n".join(lines)
+    return _localized_build_source_change_log(
+        extraction=extraction,
+        source_created=source_created,
+        source_update=source_update,
+    )
 
 
 def _format_string_list(values: list[str], limit: int = 20) -> str:
-    cleaned = [value for value in values if isinstance(value, str) and value.strip()]
-    if not cleaned:
-        return "无"
-    if len(cleaned) <= limit:
-        return "、".join(cleaned)
-    remaining = len(cleaned) - limit
-    return f"{'、'.join(cleaned[:limit])} 等 {len(cleaned)} 项（其余 {remaining} 项省略）"
+    return _localized_format_string_list(values, limit=limit)
 
 
 def _to_json_string(value: Any) -> str | None:

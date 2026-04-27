@@ -3,6 +3,7 @@ from __future__ import annotations
 from neo4j.exceptions import AuthError, ConfigurationError, ServiceUnavailable
 
 from app.core.config import BootstrapSettings, Settings
+from app.core.i18n import set_current_ui_language
 from app.core.logging import get_logger
 from app.repos import (
     InMemoryIndexJobStore,
@@ -93,6 +94,7 @@ class ServiceContainer:
         await self._close_runtime_components()
         app_config = self.config_service.get_config()
         runtime_settings = Settings.from_sources(self.bootstrap_settings, app_config)
+        set_current_ui_language(runtime_settings.ui_language)
         self._build_runtime_components(runtime_settings, app_config)
         self._register_tools()
         try:

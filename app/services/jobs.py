@@ -42,10 +42,10 @@ class JobService:
         )
         job = await self._job_store.create_job(request, max_depth=max_depth, max_pages=max_pages)
         await self._job_store.append_event(
-            JobEvent(
+            self._build_event(
                 job_id=job.job_id,
                 stage=JobStage.queued,
-                message="任务已创建，等待调度",
+                message_key="job.created_queued",
                 data={
                     "input_type": request.input_type.value,
                     "seed": request.seed(),
@@ -98,10 +98,10 @@ class JobService:
                     completion_reason="cancelled",
                 )
                 await self._job_store.append_event(
-                    JobEvent(
+                    self._build_event(
                         job_id=job_id,
                         stage=JobStage.cancelled,
-                        message="任务已取消",
+                        message_key="job.cancelled",
                         data={
                             "job_status": JobStatus.cancelled.value,
                             "cancelled": True,
@@ -119,10 +119,10 @@ class JobService:
                     completion_reason="paused",
                 )
                 await self._job_store.append_event(
-                    JobEvent(
+                    self._build_event(
                         job_id=job_id,
                         stage=JobStage.queued,
-                        message="任务已暂停",
+                        message_key="job.paused",
                         data={
                             "job_status": JobStatus.paused.value,
                             "paused": True,
@@ -137,10 +137,10 @@ class JobService:
             logger.exception("job_execution_failed", job_id=job_id, error=str(exc))
             failed_job = await self._job_store.finish_job(job_id, JobStatus.failed, last_error=str(exc))
             await self._job_store.append_event(
-                JobEvent(
+                self._build_event(
                     job_id=job_id,
                     stage=JobStage.failed,
-                    message="任务执行失败",
+                    message_key="job.execution_failed",
                     data={
                         "error": str(exc),
                         "job_status": JobStatus.failed.value,
@@ -158,7 +158,10 @@ class JobService:
         return await self._job_store.get_job(job_id)
 
     async def get_events(self, job_id: str) -> list[JobEvent]:
-        return await self._job_store.get_events(job_id)
+        return [
+            event.localized(self._settings.ui_language.value)
+            for event in await self._job_store.get_events(job_id)
+        ]
 
     async def resume_job(self, job_id: str) -> JobSummary | None:
         job = await self._job_store.get_job(job_id)
@@ -179,10 +182,10 @@ class JobService:
             completed_at=None,
         )
         await self._job_store.append_event(
-            JobEvent(
+            self._build_event(
                 job_id=job_id,
                 stage=JobStage.queued,
-                message="任务已恢复，等待调度",
+                message_key="job.resumed_queued",
                 data={
                     "job_status": JobStatus.queued.value,
                     "resume": True,
@@ -220,10 +223,10 @@ class JobService:
                 completion_reason="paused",
             )
             await self._job_store.append_event(
-                JobEvent(
+                self._build_event(
                     job_id=job_id,
                     stage=JobStage.queued,
-                    message="任务已暂停",
+                    message_key="job.paused",
                     data={
                         "job_status": JobStatus.paused.value,
                         "paused": True,
@@ -263,10 +266,10 @@ class JobService:
                 completion_reason="cancelled",
             )
             await self._job_store.append_event(
-                JobEvent(
+                self._build_event(
                     job_id=job_id,
                     stage=JobStage.cancelled,
-                    message="任务已取消",
+                    message_key="job.cancelled",
                     data={
                         "job_status": JobStatus.cancelled.value,
                         "cancelled": True,
@@ -281,7 +284,7 @@ class JobService:
         while True:
             events = await self._job_store.get_events(job_id)
             for event in events[sent:]:
-                yield {"data": event.model_dump_json()}
+                yield {"data": event.localized(self._settings.ui_language.value).model_dump_json()}
             sent = len(events)
 
             job = await self._job_store.get_job(job_id)
@@ -317,3 +320,22 @@ class JobService:
             checkpoint_updated_at=checkpoint.updated_at,
             completion_reason=checkpoint.completion_reason,
         )
+
+    def _build_event(
+        self,
+        *,
+        job_id: str,
+        stage: JobStage,
+        message_key: str,
+        data: dict[str, object] | None = None,
+        url: str | None = None,
+    ) -> JobEvent:
+        payload = dict(data or {})
+        return JobEvent(
+            job_id=job_id,
+            stage=stage,
+            message_key=message_key,
+            message_params=payload,
+            url=url,
+            data=payload,
+        ).localized(self._settings.ui_language.value)

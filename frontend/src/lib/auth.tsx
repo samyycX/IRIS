@@ -9,11 +9,14 @@ import {
 } from 'react'
 import type { ReactNode } from 'react'
 
+import { syncUiLanguage, type UiLanguage } from '@/i18n'
+
 const AUTH_REQUIRED_EVENT = 'iris-auth-required'
 
 type AuthStatus = {
   bypass_enabled: boolean
   authenticated: boolean
+  ui_language: UiLanguage
 }
 
 type LoginResult =
@@ -75,6 +78,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const loadStatus = useEffectEvent(async () => {
     const status = await fetchAuthStatus()
     if (status) {
+      await syncUiLanguage(status.ui_language)
       applyStatus(status)
     } else {
       startTransition(() => {
@@ -124,6 +128,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             error: response.status === 401 ? 'auth.invalid_password' : 'auth.request_failed',
           }
         }
+        await syncUiLanguage(payload.ui_language)
         applyStatus(payload)
         return { ok: true }
       } catch {
@@ -140,7 +145,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           credentials: 'same-origin',
         })
         if (response.ok) {
-          applyStatus(await response.json())
+          const payload = await response.json()
+          await syncUiLanguage(payload.ui_language)
+          applyStatus(payload)
           return
         }
       } finally {

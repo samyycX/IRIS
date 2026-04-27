@@ -6,13 +6,18 @@ from typing import TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
-APP_CONFIG_SCHEMA_VERSION = 3
+APP_CONFIG_SCHEMA_VERSION = 4
 
 
 class DataSourceKind(str, Enum):
     neo4j = "neo4j"
     llm = "llm"
     embedding = "embedding"
+
+
+class UiLanguage(str, Enum):
+    zh = "zh"
+    en = "en"
 
 
 class BaseProfile(BaseModel):
@@ -80,6 +85,7 @@ class RuntimeConfig(BaseModel):
     embedding_batch_size: int = Field(default=16, ge=1)
     embedding_text_max_chars: int = Field(default=4000, ge=1)
     embedding_version: str = "v1"
+    ui_language: UiLanguage = UiLanguage.zh
     visited_url_ttl_days: int = 10
     allowed_domains_enabled: bool = False
     allowed_domains: list[str] = Field(default_factory=list)

@@ -4,12 +4,13 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.models.config import AppConfig
+from app.models.config import AppConfig, UiLanguage
 
 
 class _SettingsFields(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    ui_language: UiLanguage = Field(default=UiLanguage.zh, alias="UI_LANGUAGE")
 
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
@@ -70,6 +71,7 @@ class Settings(_SettingsFields):
         runtime = app_config.runtime
         return cls(
             log_level=bootstrap.log_level,
+            ui_language=runtime.ui_language,
             data_root=str(bootstrap.data_root),
             openai_base_url=llm.base_url if llm else "",
             openai_api_key=llm.api_key if llm else "",

@@ -1,6 +1,41 @@
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 
+export type UiLanguage = 'zh' | 'en';
+
+function applyDocumentLanguage(language: UiLanguage): void {
+  if (typeof document !== 'undefined') {
+    document.documentElement.lang = language;
+  }
+}
+
+export function normalizeUiLanguage(language: string | null | undefined): UiLanguage {
+  if ((language || '').toLowerCase().startsWith('zh')) {
+    return 'zh';
+  }
+  return 'en';
+}
+
+export async function syncUiLanguage(language: string | null | undefined): Promise<UiLanguage> {
+  const nextLanguage = normalizeUiLanguage(language);
+  const currentLanguage = normalizeUiLanguage(i18n.resolvedLanguage ?? i18n.language);
+  if (currentLanguage !== nextLanguage) {
+    await i18n.changeLanguage(nextLanguage);
+  }
+  applyDocumentLanguage(nextLanguage);
+  return nextLanguage;
+}
+
+function getInitialUiLanguage(): UiLanguage {
+  if (typeof document !== 'undefined' && document.documentElement.lang) {
+    return normalizeUiLanguage(document.documentElement.lang);
+  }
+  if (typeof navigator !== 'undefined') {
+    return normalizeUiLanguage(navigator.language);
+  }
+  return 'en';
+}
+
 const resources = {
   zh: {
     translation: {
@@ -99,7 +134,7 @@ const resources = {
       "index.no_candidates": "没有候选对象。",
       "index.vector_section_desc": "检查缺失或过期的 embedding 并执行补全或重建任务。",
       "index.fulltext_section_desc": "检查缺失或过期的全文检索文本并执行补全，以及管理和重构索引本身。",
-      "index.fulltext_property_note": "注意：此处的补全和重建任务是针对实体的全文检索文本属性的。下方的状态和建立操作则是针对 Neo4j 中的索引结构本身的。",
+      "index.fulltext_property_note": "注意：此处的状态和建立操作是针对 Neo4j 中的索引结构本身的。下方的补全和重建任务则是针对实体的全文检索文本属性的。",
       "index.jobs_volatile_note": "任务入口保存在后端内存中，服务重启后会丢失。",
       "index.fulltext_status": "全文索引状态",
       "index.check": "检查",
@@ -203,6 +238,10 @@ const resources = {
       "runtime.embedding_text_max_chars_desc": "每个向量文本块的最大字符数。",
       "runtime.embedding_version": "向量版本",
       "runtime.embedding_version_desc": "向量数据的版本标识。",
+      "runtime.ui_language": "界面与日志语言",
+      "runtime.ui_language_desc": "控制前端界面语言，以及后端新生成的人类可读日志语言。",
+      "runtime.ui_language_zh": "中文",
+      "runtime.ui_language_en": "English",
       "runtime.visited_url_ttl_days": "已访问URL过期天数",
       "runtime.visited_url_ttl_days_desc": "已访问过的URL在多少天内不会被重复抓取。",
       "runtime.allowed_domains": "允许的域名",
@@ -356,7 +395,7 @@ const resources = {
       "index.no_candidates": "No candidates.",
       "index.vector_section_desc": "Check for missing or expired embeddings and run backfill or reindex jobs.",
       "index.fulltext_section_desc": "Check for missing or expired fulltext texts, and manage the fulltext indexes themselves.",
-      "index.fulltext_property_note": "Note: Backfill and Reindex tasks here operate on the searchable text properties. The Status and Build actions below manage the actual Neo4j indexes.",
+      "index.fulltext_property_note": "Note: The Status and Build actions here manage the actual Neo4j indexes. Backfill and Reindex tasks below operate on the searchable text properties.",
       "index.jobs_volatile_note": "Jobs are kept in backend memory and disappear after service restart.",
       "index.fulltext_status": "Fulltext Index Status",
       "index.check": "Check",
@@ -460,6 +499,10 @@ const resources = {
       "runtime.embedding_text_max_chars_desc": "Maximum characters per text chunk for embedding.",
       "runtime.embedding_version": "Embedding Version",
       "runtime.embedding_version_desc": "Version identifier for the embeddings.",
+      "runtime.ui_language": "UI And Log Language",
+      "runtime.ui_language_desc": "Controls the frontend language and the language used for newly generated human-readable backend logs.",
+      "runtime.ui_language_zh": "Chinese",
+      "runtime.ui_language_en": "English",
       "runtime.visited_url_ttl_days": "Visited URL TTL (Days)",
       "runtime.visited_url_ttl_days_desc": "Days before a visited URL can be crawled again.",
       "runtime.allowed_domains": "Allowed Domains",
@@ -518,11 +561,15 @@ const resources = {
   }
 };
 
+const initialLanguage = getInitialUiLanguage();
+
+applyDocumentLanguage(initialLanguage);
+
 i18n
   .use(initReactI18next)
   .init({
     resources,
-    lng: "zh",
+    lng: initialLanguage,
     fallbackLng: "en",
     interpolation: {
       escapeValue: false

@@ -5,13 +5,21 @@ from typing import Any
 
 import structlog
 
+from app.core.i18n import render_text
 
-def _rename_event_key(
+
+def _localize_event_key(
     logger: Any, method_name: str, event_dict: MutableMapping[str, Any]
 ) -> MutableMapping[str, Any]:
     event = event_dict.pop("event", None)
     if event is not None:
-        event_dict["message"] = event
+        event_key = str(event)
+        event_dict["message_key"] = event_key
+        event_dict["message"] = render_text(
+            event_key,
+            params=event_dict,
+            default=event_key,
+        )
     event_dict["level"] = method_name
     return event_dict
 
@@ -21,7 +29,7 @@ def configure_logging(log_level: str) -> None:
     pre_chain = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
-        _rename_event_key,
+        _localize_event_key,
         timestamper,
     ]
 

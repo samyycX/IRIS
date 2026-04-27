@@ -195,12 +195,12 @@ class GraphRAGWorkflow:
     def _build_extraction_chain(self):
         llm = self._require_llm()
         prompt = build_page_extraction_prompt()
-        return prompt | llm.with_structured_output(GraphRAGExtractionPayload)
+        return prompt | llm.with_structured_output(GraphRAGExtractionPayload, method="json_mode")
 
     def _build_related_url_chain(self):
         llm = self._require_llm()
         prompt = build_related_url_filter_prompt()
-        return prompt | llm.with_structured_output(GraphRAGLinkSelectionPayload)
+        return prompt | llm.with_structured_output(GraphRAGLinkSelectionPayload, method="json_mode")
 
     def _require_llm(self) -> ChatOpenAI:
         if self._llm is None:

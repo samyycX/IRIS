@@ -211,6 +211,10 @@ def migrate_app_config(payload: dict[str, Any], bootstrap: BootstrapSettings) ->
             data = _migrate_v2_to_v3(data)
             version = 3
             continue
+        if version == 3:
+            data = _migrate_v3_to_v4(data)
+            version = 4
+            continue
         raise ValueError(f"Unsupported app config schema version: {version}")
     data = _normalize_search_api_permission_source_ids(data)
     data["schema_version"] = APP_CONFIG_SCHEMA_VERSION
@@ -253,6 +257,16 @@ def _migrate_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
         default_payload = SearchApiConfig().model_dump(mode="json")
         default_payload.update(search_api_payload)
         migrated["search_api"] = default_payload
+    return migrated
+
+
+def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = deepcopy(payload)
+    runtime_payload = migrated.get("runtime")
+    if not isinstance(runtime_payload, dict):
+        migrated["runtime"] = RuntimeConfig().model_dump(mode="json")
+        return migrated
+    runtime_payload.setdefault("ui_language", RuntimeConfig().ui_language.value)
     return migrated
 
 

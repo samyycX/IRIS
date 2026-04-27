@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, HttpUrl
 
+from app.core.i18n import render_text
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -99,10 +101,26 @@ class JobEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid4()))
     job_id: str
     stage: JobStage
-    message: str
+    message: str = ""
+    message_key: str | None = None
+    message_params: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
     url: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
+
+    def localized(self, language: str | None = None) -> "JobEvent":
+        if not self.message_key:
+            return self.model_copy(deep=True)
+        return self.model_copy(
+            update={
+                "message": render_text(
+                    self.message_key,
+                    params=self.message_params,
+                    language=language,
+                    default=self.message or self.message_key,
+                )
+            }
+        )
 
 
 class JobQueueItem(BaseModel):

@@ -25,7 +25,7 @@
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "neo4j_profiles": [
     {
       "id": "local-neo4j",
@@ -81,6 +81,7 @@
     ]
   },
   "runtime": {
+    "ui_language": "zh",
     "embedding_dimensions": 1536,
     "embedding_batch_size": 16,
     "embedding_text_max_chars": 4000,
@@ -113,6 +114,10 @@
 - `permission_sources`: 统一权限源列表，`kind` 取值为 `api_key` 或 `ip`。
 - `allow_builtin_embedding`: 是否允许该权限源直接调用服务端内置 Embedding。若为 `false`，向量/混合搜索必须显式传入 `query_vector`。
 
+`runtime` 中与语言相关的字段：
+
+- `ui_language`: 后端新生成的日志消息、任务事件 message、工具说明等人类可读文本使用的语言。当前支持 `zh` 和 `en`，并直接跟随前端界面语言。
+
 ## 接口列表
 
 ### 1. 读取完整配置
@@ -135,7 +140,7 @@
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "data_root": "E:/programming/IRIS/data",
   "active_profiles": {
     "neo4j": "local-neo4j",
@@ -328,7 +333,7 @@
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "neo4j_profiles": [],
   "active_neo4j_profile_id": null,
   "llm_profiles": [],

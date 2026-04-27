@@ -4,6 +4,7 @@ import contextlib
 import re
 
 from app.core.config import Settings
+from app.core.i18n import render_text
 
 
 class HttpFetcher:
@@ -18,10 +19,7 @@ class HttpFetcher:
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:  # pragma: no cover - depends on optional runtime package
-            raise RuntimeError(
-                "未安装 Playwright。请先执行 `pip install playwright` "
-                "并运行 `playwright install chromium`。"
-            ) from exc
+            raise RuntimeError(render_text("fetcher.playwright_not_installed")) from exc
 
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(headless=True)
@@ -101,7 +99,7 @@ class HttpFetcher:
         try:
             response = await page.goto(url, wait_until="domcontentloaded")
             if response is None:
-                raise RuntimeError("浏览器抓取失败：未收到页面响应。")
+                raise RuntimeError(render_text("fetcher.no_response"))
 
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("networkidle", timeout=min(5000, self._settings.browser_navigation_timeout_ms))

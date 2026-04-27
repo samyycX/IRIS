@@ -4,6 +4,15 @@
 
 @layer base {
   :root {
+    --font-sans:
+      'Geist Variable',
+      'Source Han Sans SC VF',
+      'Source Han Sans SC',
+      'Noto Sans SC',
+      'PingFang SC',
+      'Hiragino Sans GB',
+      'Microsoft YaHei',
+      sans-serif;
     --background: 0 0% 100%;
     --foreground: 240 10% 3.9%;
     --card: 0 0% 100%;
@@ -62,7 +71,16 @@
   * {
     @apply border-border;
   }
+  html {
+    font-family: var(--font-sans);
+  }
   body {
     @apply bg-background text-foreground;
+  }
+  button,
+  input,
+  select,
+  textarea {
+    font-family: inherit;
   }
 }

@@ -10,29 +10,66 @@ import IndexJobDetail from './pages/IndexJobDetail'
 import SearchPreview from './pages/SearchPreview'
 import Configuration from './pages/Configuration'
 import SearchApiAuth from './pages/SearchApiAuth'
-import { Activity, Languages, LogOut } from 'lucide-react'
+import { Languages, LogOut } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card'
 import { Input } from './components/ui/input'
 import { Label } from './components/ui/label'
-import { useAuth } from './lib/auth'
+import { syncUiLanguage, type UiLanguage } from './i18n'
+import { apiFetch, useAuth } from './lib/auth'
 
 
 function isChineseLanguage(language: string) {
   return language.toLowerCase().startsWith('zh')
 }
 
+async function persistUiLanguage(language: UiLanguage) {
+  const configResponse = await apiFetch('/api/config')
+  if (!configResponse.ok) {
+    throw new Error(`Failed to load config: ${configResponse.status}`)
+  }
+  const config = await configResponse.json()
+  const saveResponse = await apiFetch('/api/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...config,
+      runtime: {
+        ...config.runtime,
+        ui_language: language,
+      },
+    }),
+  })
+  if (!saveResponse.ok) {
+    throw new Error(`Failed to save language: ${saveResponse.status}`)
+  }
+}
+
 function LanguageSwitcher({ className = '' }: { className?: string }) {
   const { t, i18n } = useTranslation()
+  const { authenticated, bypassEnabled } = useAuth()
   const isChinese = isChineseLanguage(i18n.resolvedLanguage ?? i18n.language)
   const nextLanguageLabel = isChinese ? 'English' : '中文'
+
+  const handleClick = async () => {
+    const nextLanguage: UiLanguage = isChinese ? 'en' : 'zh'
+    await syncUiLanguage(nextLanguage)
+    if (!authenticated && !bypassEnabled) {
+      return
+    }
+    try {
+      await persistUiLanguage(nextLanguage)
+    } catch (err) {
+      console.error(err)
+    }
+  }
 
   return (
     <Button
       type="button"
       variant="outline"
       size="sm"
-      onClick={() => void i18n.changeLanguage(isChinese ? 'en' : 'zh')}
+      onClick={() => void handleClick()}
       className={`h-9 rounded-full border-border/70 bg-background/80 px-3 text-sm shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/70 ${className}`.trim()}
       aria-label={isChinese ? t('nav.switch_to_english') : t('nav.switch_to_chinese')}
       title={isChinese ? t('nav.switch_to_english') : t('nav.switch_to_chinese')}
@@ -69,9 +106,7 @@ function LoginScreen() {
       <Card className="w-full max-w-md border-border/70 shadow-2xl shadow-black/10">
         <CardHeader className="space-y-3">
           <div className="flex items-center gap-3 text-lg font-semibold">
-            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10 text-primary">
-              <Activity className="h-5 w-5" />
-            </div>
+            <img src="./logo.png" className="h-5 w-5" />
             {t('auth.title')}
           </div>
           <CardTitle>{t('auth.subtitle')}</CardTitle>
@@ -129,7 +164,7 @@ function App() {
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:gap-8">
             <Link to="/" className="flex items-center gap-2 font-semibold text-lg">
-              <Activity className="w-5 h-5" />
+              <img src="./logo.png" className="h-5 w-5" />
               {t('app.brand')}
             </Link>
             <nav className="flex flex-wrap items-center gap-x-5 gap-y-2">

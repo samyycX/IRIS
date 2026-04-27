@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import TYPE_CHECKING
 
+from app.core.i18n import render_text
 from app.core.logging import get_logger
 from app.models import (
     GraphUpdateResult,
@@ -71,7 +72,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.queued,
-            "任务继续执行" if checkpoint is not None else "任务已开始执行",
+            message_key="job.run_resumed" if checkpoint is not None else "job.run_started",
             data={
                 "input_type": request.input_type.value,
                 "seed": request.seed(),
@@ -95,7 +96,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.summarizing,
-            "开始处理手工输入内容",
+            message_key="job.manual_input_processing_started",
             data={"seed_length": len(seed_text)},
         )
         extraction = await _await_with_timeout(
@@ -104,12 +105,15 @@ class CrawlPipeline:
                 seed_text=seed_text,
             ),
             timeout_seconds=self._llm_timeout_seconds,
-            timeout_message=f"手工输入摘要与实体抽取超时（>{self._llm_timeout_seconds} 秒）",
+            timeout_message=render_text(
+                "job.timeout.manual_seed_analysis",
+                params={"timeout_seconds": self._llm_timeout_seconds},
+            ),
         )
         await self._emit(
             job_id,
             JobStage.summarizing,
-            "手工输入内容已完成摘要与实体抽取",
+            message_key="job.manual_input_processed",
             url=extraction.canonical_url,
             data={
                 "elapsed_ms": _elapsed_ms(llm_started_at),
@@ -121,7 +125,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.updating_graph,
-            "开始写入知识图谱",
+            message_key="job.graph_update_started",
             url=extraction.canonical_url,
             data={"entity_count": len(extraction.extracted_entities)},
         )
@@ -138,7 +142,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.completed,
-            "手工输入已完成知识图谱更新",
+            message_key="job.manual_graph_updated",
             url=extraction.canonical_url,
             data={
                 **result.model_dump(),
@@ -171,7 +175,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.discovering,
-            "已恢复 URL 抓取队列" if checkpoint is not None else "已初始化 URL 抓取队列",
+            message_key="job.url_queue_restored" if checkpoint is not None else "job.url_queue_initialized",
             url=seed_url,
             data={
                 "seed_url": seed_url,
@@ -204,7 +208,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.discovering,
-                "达到页面数量上限，停止继续抓取",
+                message_key="job.max_pages_reached",
                 data={"visited_count": state.visited_count, "max_pages": max_pages},
             )
 
@@ -227,7 +231,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.completed,
-            "任务执行完成",
+            message_key="job.completed",
             data={
                 **state.total_update.model_dump(),
                 "completion_reason": state.completion_reason,
@@ -383,7 +387,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.discovering,
-            "从队列中取出一个页面准备处理",
+            message_key="job.url_dequeued",
             url=url,
             data={
                 "depth": depth,
@@ -396,7 +400,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.discovering,
-                "跳过超过最大深度的 URL",
+                message_key="job.skip_depth_limit",
                 url=url,
                 data={"depth": depth, "max_depth": max_depth},
             )
@@ -405,7 +409,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.discovering,
-                "跳过当前任务内已访问的 URL",
+                message_key="job.skip_job_seen_url",
                 url=url,
                 data={"depth": depth},
             )
@@ -419,7 +423,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.discovering,
-                "当前种子 URL 为用户主动输入，绕过历史访问判重",
+                message_key="job.seed_url_history_bypass",
                 url=url,
                 data={"depth": depth, "reason": "seed_url_bypass_history"},
             )
@@ -429,14 +433,20 @@ class CrawlPipeline:
                 await self._emit(
                     job_id,
                     JobStage.discovering,
-                    "跳过历史已处理的 URL",
+                    message_key="job.skip_history_seen_url",
                     url=url,
                     data={"depth": depth, "reason": "history_seen"},
                 )
                 return
 
         page_started_at = monotonic()
-        await self._emit(job_id, JobStage.fetching, "开始抓取页面", url=url, data={"depth": depth})
+        await self._emit(
+            job_id,
+            JobStage.fetching,
+            message_key="job.fetch_started",
+            url=url,
+            data={"depth": depth},
+        )
         try:
             page_payload = await self._tool_executor.execute(
                 "fetch_url",
@@ -452,7 +462,7 @@ class CrawlPipeline:
                 await self._emit(
                     job_id,
                     JobStage.discovering,
-                    "跳过当前任务内已访问的规范化 URL",
+                    message_key="job.skip_canonical_seen_url",
                     url=page_payload["canonical_url"],
                     data={"depth": depth, "reason": "canonical_url_seen"},
                 )
@@ -460,7 +470,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.extracting,
-                "页面抓取成功，开始正文抽取",
+                message_key="job.fetch_completed_extracting",
                 url=page_payload["canonical_url"],
                 data={
                     "depth": depth,
@@ -476,7 +486,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.summarizing,
-                "开始查询图谱上下文并调用 LLM",
+                message_key="job.llm_context_started",
                 url=page_payload["canonical_url"],
                 data={
                     "depth": depth,
@@ -499,19 +509,19 @@ class CrawlPipeline:
                     filter_candidate_urls=request.filter_candidate_urls,
                 ),
                 timeout_seconds=self._llm_timeout_seconds,
-                timeout_message=(
-                    f"查询图谱上下文并调用 LLM 超时（>{self._llm_timeout_seconds} 秒）"
+                timeout_message=render_text(
+                    "job.timeout.page_analysis",
+                    params={"timeout_seconds": self._llm_timeout_seconds},
                 ),
-            )
-            summarizing_message = (
-                "LLM 已完成页面摘要、实体抽取与关联链接排序"
-                if request.filter_candidate_urls
-                else "LLM 已完成页面摘要与实体抽取，待选 URL 未筛选"
             )
             await self._emit(
                 job_id,
                 JobStage.summarizing,
-                summarizing_message,
+                message_key=(
+                    "job.llm_completed_filtered"
+                    if request.filter_candidate_urls
+                    else "job.llm_completed_unfiltered"
+                ),
                 url=extraction.canonical_url,
                 data={
                     "is_relevant": extraction.is_relevant,
@@ -529,7 +539,7 @@ class CrawlPipeline:
                 await self._emit(
                     job_id,
                     JobStage.summarizing,
-                    "页面与当前主题无关，跳过入库和后续扩展",
+                    message_key="job.irrelevant_skipped",
                     url=extraction.canonical_url,
                     data={
                         "depth": depth,
@@ -542,7 +552,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.updating_graph,
-                "开始写入知识图谱",
+                message_key="job.graph_update_started",
                 url=extraction.canonical_url,
                 data={"entity_count": len(extraction.extracted_entities)},
             )
@@ -560,7 +570,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.updating_graph,
-                "知识图谱更新完成",
+                message_key="job.graph_update_completed",
                 url=extraction.canonical_url,
                 data={
                     **update.model_dump(),
@@ -581,10 +591,10 @@ class CrawlPipeline:
                 await self._emit(
                     job_id,
                     JobStage.discovering,
-                    (
-                        "已根据 LLM 排序后的关联链接更新抓取队列"
+                    message_key=(
+                        "job.queue_updated_filtered"
                         if request.filter_candidate_urls
-                        else "已根据未筛选的候选链接更新抓取队列"
+                        else "job.queue_updated_unfiltered"
                     ),
                     url=page_payload["canonical_url"],
                     data={
@@ -605,7 +615,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.failed,
-                "页面处理失败",
+                message_key="job.page_failed",
                 url=url,
                 data={"error": str(exc), "page_elapsed_ms": _elapsed_ms(page_started_at)},
             )
@@ -615,8 +625,9 @@ class CrawlPipeline:
         self,
         job_id: str,
         stage: JobStage,
-        message: str,
+        message: str | None = None,
         *,
+        message_key: str | None = None,
         url: str | None = None,
         data: dict | None = None,
     ) -> None:
@@ -633,11 +644,13 @@ class CrawlPipeline:
         event = JobEvent(
             job_id=job_id,
             stage=stage,
-            message=message,
+            message=message or "",
+            message_key=message_key,
+            message_params=payload if message_key else {},
             url=url,
             data=payload,
         )
-        await self._event_store.append_event(event)
+        await self._event_store.append_event(event.localized())
 
     def _restore_url_job_state(
         self,
@@ -739,7 +752,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.updating_graph,
-            "检测到图谱变更，开始自动触发索引补全任务",
+            message_key="job.auto_index_backfill_detected",
             data=graph_update.model_dump(),
         )
         try:
@@ -751,7 +764,7 @@ class CrawlPipeline:
             await self._emit(
                 job_id,
                 JobStage.updating_graph,
-                "自动触发索引补全失败，已跳过",
+                message_key="job.auto_index_backfill_failed",
                 data={"error": str(exc)},
             )
             return {
@@ -771,7 +784,7 @@ class CrawlPipeline:
         await self._emit(
             job_id,
             JobStage.updating_graph,
-            "自动索引补全任务已处理",
+            message_key="job.auto_index_backfill_processed",
             data={
                 "created_jobs": created_jobs,
                 "skipped_jobs": skipped_jobs,

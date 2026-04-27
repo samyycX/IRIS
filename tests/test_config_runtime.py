@@ -2,7 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import BootstrapSettings, Settings
-from app.models import AppConfig, LLMProfile, Neo4jProfile, RuntimeConfig
+from app.models import AppConfig, LLMProfile, Neo4jProfile, RuntimeConfig, UiLanguage
 from app.services.app_config import migrate_app_config
 
 
@@ -65,6 +65,15 @@ def test_settings_keep_allowed_domains_when_whitelist_is_on():
 
     assert settings.allowed_domains_enabled is True
     assert settings.allowed_domains == ["wiki.example.com"]
+
+
+def test_settings_include_ui_language_from_runtime_config():
+    settings = Settings.from_sources(
+        BootstrapSettings(iris_password_bypass=True),
+        AppConfig(runtime=RuntimeConfig(ui_language=UiLanguage.en)),
+    )
+
+    assert settings.ui_language == UiLanguage.en
 
 
 def test_bootstrap_settings_require_password_or_bypass(tmp_path, monkeypatch):
@@ -132,10 +141,34 @@ def test_migrate_app_config_adds_search_api_defaults_for_v2_payload():
         BootstrapSettings(iris_password_bypass=True),
     )
 
-    assert migrated.schema_version == 3
+    assert migrated.schema_version == 4
     assert migrated.search_api.enabled is False
     assert migrated.search_api.validation_enabled is True
     assert migrated.search_api.permission_sources == []
+
+
+def test_migrate_app_config_adds_default_ui_language_for_v3_payload():
+    migrated = migrate_app_config(
+        {
+            "schema_version": 3,
+            "neo4j_profiles": [],
+            "active_neo4j_profile_id": None,
+            "llm_profiles": [],
+            "active_llm_profile_id": None,
+            "embedding_profiles": [],
+            "active_embedding_profile_id": None,
+            "runtime": {},
+            "search_api": {
+                "enabled": False,
+                "validation_enabled": True,
+                "permission_sources": [],
+            },
+        },
+        BootstrapSettings(iris_password_bypass=True),
+    )
+
+    assert migrated.schema_version == 4
+    assert migrated.runtime.ui_language == UiLanguage.zh
 
 
 def test_migrate_app_config_normalizes_blank_search_permission_source_ids():

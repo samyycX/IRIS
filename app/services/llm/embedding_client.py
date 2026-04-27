@@ -6,6 +6,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.core.config import Settings
+from app.core.i18n import render_text
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -33,7 +34,7 @@ class EmbeddingClient:
         if not texts:
             return []
         if not self.enabled:
-            raise RuntimeError("Embedding client is not configured.")
+            raise RuntimeError(render_text("embedding_client_not_configured"))
 
         logger.info(
             "embedding_request_start",
@@ -87,12 +88,12 @@ class EmbeddingClient:
 
     def _require_client(self):
         if self._client is None:
-            raise RuntimeError("Embedding client is not configured.")
+            raise RuntimeError(render_text("embedding_client_not_configured"))
         return self._client
 
     def _require_health_client(self) -> AsyncOpenAI:
         if self._health_client is None:
-            raise RuntimeError("Embedding client is not configured.")
+            raise RuntimeError(render_text("embedding_client_not_configured"))
         return self._health_client
 
 

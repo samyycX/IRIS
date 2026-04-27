@@ -348,20 +348,6 @@ export default function IndexManagement() {
           {jobs.length === 0 && <div className="text-sm text-muted-foreground">{t('index.no_jobs')}</div>}
         </CardContent>
       </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>{t('index.query_preview')}</CardTitle>
-          <CardDescription>
-            {t('index.query_preview_moved')}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Link to="/search">
-            <Button>{t('index.go_to_search_preview')}</Button>
-          </Link>
-        </CardContent>
-      </Card>
     </div>
   )
 }

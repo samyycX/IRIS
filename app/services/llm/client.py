@@ -300,7 +300,7 @@ class LLMClient:
             base_url=self._settings.openai_base_url,
             temperature=0,
         )
-        return prompt | llm.with_structured_output(ExtractedEntity)
+        return prompt | llm.with_structured_output(ExtractedEntity, method="json_mode")
 
     def _require_merge_chain(self):
         if self._merge_chain is None:
